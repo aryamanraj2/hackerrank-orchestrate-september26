@@ -191,6 +191,16 @@ class Forecast:
         return "\n".join(lines)
 
 
+def same_day_order(day: date, amount: Decimal) -> tuple[date, bool]:
+    """Sort key for cash movements: by day, and within a day credits first.
+
+    Confirmed income settling on a day can fund a debit on that same day. The
+    forecast ledger and the engine's payment simulation both sort with this
+    key, so the rule lives in one place.
+    """
+    return day, amount < 0
+
+
 def _counts_as_income(event) -> bool:
     return (
         event.event_type in COUNTED_CREDIT_EVENT_TYPES
@@ -343,6 +353,8 @@ def _recurrence_entries(
     notes: list[ForecastNote] = []
     events_by_id = {event.event_id: event for event in events}
     patterns = recurrence_patterns(events, as_of=start)
+    projected: list[tuple] = []
+    credit_candidates: list[tuple] = []
 
     for (category, direction, stream), pattern in sorted(patterns.items()):
         source_id = f"{category}/{direction}" + (f"/{stream}" if stream else "")
@@ -368,34 +380,82 @@ def _recurrence_entries(
                 )
             )
             continue
+        window = max(1, pattern.cadence_days // 2)
+        # An occurrence due on the request date is still owed. A settled row of
+        # the series that day is already history (``as_of`` is inclusive), so
+        # projection resumes after it and it is never booked twice.
+        # ponytail: a same-day settled row the detector leaves out of the series
+        # is not matched; add a same-series check if that shows up in data.
+        candidates = [
+            (day, source_id, category, group, window, pattern, extremes, direction)
+            for day in pattern.occurrences_between(start, end)
+        ]
+        if direction == "credit":
+            credit_candidates += candidates
+            continue
         # A supplied row for the same series already books that occurrence; a
         # half-cadence window spots the overlap without matching individual
         # rows to projected dates.
-        window = max(1, pattern.cadence_days // 2)
         explicit = [
             day for day, _, _, _, _, entry_group in booked if entry_group == group
         ]
-        blocked_currencies: set[str] = set()
-        for day in pattern.occurrences_between(start + timedelta(days=1), end):
-            if any(abs((day - other).days) < window for other in explicit):
-                continue
-            amount, missing_currency = _projected_amount(
-                dataset, pattern, extremes, home_currency, day
+        projected += [
+            candidate
+            for candidate in candidates
+            if not any(abs((candidate[0] - other).days) < window for other in explicit)
+        ]
+
+    # A booked credit is that cycle's pay, whatever description it carries: it
+    # stands in for the nearest projected credit of the same category within
+    # that projection's half-cadence window, and for no more than one.
+    suppressed: set[int] = set()
+    for day, _, _, event_id, category, group in sorted(
+        (item for item in booked if item[1] > 0), key=lambda item: (item[0], item[3])
+    ):
+        matches = [
+            (abs((candidate[0] - day).days), candidate[3] != group, candidate[0], candidate[1], index)
+            for index, candidate in enumerate(credit_candidates)
+            if index not in suppressed
+            and candidate[2] == category
+            and abs((candidate[0] - day).days) < candidate[4]
+        ]
+        if not matches:
+            continue
+        *_, index = min(matches)
+        suppressed.add(index)
+        match_day, match_source = credit_candidates[index][:2]
+        notes.append(
+            ForecastNote(
+                match_source,
+                f"occurrence on {match_day} not projected: booked credit {event_id} "
+                f"on {day} is the same {category} income",
             )
-            if amount is None:
-                if missing_currency not in blocked_currencies:
-                    blocked_currencies.add(missing_currency)
-                    blockers.append(
-                        ForecastBlocker(
-                            source_id,
-                            day,
-                            f"no supplied {missing_currency}->{home_currency} rate "
-                            f"on projected date {day}",
-                        )
+        )
+    projected += [
+        candidate
+        for index, candidate in enumerate(credit_candidates)
+        if index not in suppressed
+    ]
+
+    blocked: set[tuple[str, str]] = set()
+    for day, source_id, category, group, _, pattern, extremes, direction in projected:
+        amount, missing_currency = _projected_amount(
+            dataset, pattern, extremes, home_currency, day
+        )
+        if amount is None:
+            if (source_id, missing_currency) not in blocked:
+                blocked.add((source_id, missing_currency))
+                blockers.append(
+                    ForecastBlocker(
+                        source_id,
+                        day,
+                        f"no supplied {missing_currency}->{home_currency} rate "
+                        f"on projected date {day}",
                     )
-                continue
-            signed = -amount if direction == "debit" else amount
-            movements.append((day, signed, "recurrence", source_id, category, group))
+                )
+            continue
+        signed = -amount if direction == "debit" else amount
+        movements.append((day, signed, "recurrence", source_id, category, group))
     notes += _unprojected_income_notes(events, patterns, start=start)
     return movements, blockers, notes
 
@@ -503,11 +563,9 @@ def build_forecast(
     notes += [ForecastNote(source_id, reason) for source_id, reason in evidence_notes]
 
     events_by_id = {event.event_id: event for event in events}
-    # Same-day debits are applied before credits: the balance must survive the
-    # worst intraday ordering, not the most convenient one.
     ordered = sorted(
         movements + projected,
-        key=lambda item: (item[0], 0 if item[1] < 0 else 1, item[3]),
+        key=lambda item: (*same_day_order(item[0], item[1]), item[3]),
     )
 
     entries: list[LedgerEntry] = []

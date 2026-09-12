@@ -10,6 +10,7 @@ predictions are written.
     python3 code/main.py --validate    # same, stated explicitly
     python3 code/main.py --check-output output.csv   # + semantic recommendation checks
     python3 code/main.py --forecast request_26       # print one baseline cash ledger
+    python3 code/main.py --predict                   # write output.csv at the repo root
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cashflow import forecast_for_request  # noqa: E402
+from engine import write_predictions  # noqa: E402
 from dataset_loader import Dataset, find_dataset_root, load_dataset  # noqa: E402
 from output_schema import REQUIRED_OUTPUT_COLUMNS, validate_output_row_values  # noqa: E402
 from recommendation_schema import (  # noqa: E402
@@ -31,6 +33,7 @@ from recommendation_schema import (  # noqa: E402
 from validation import DatasetError, ValidationIssue, data_line, format_issues  # noqa: E402
 
 DEFAULT_ISSUE_LIMIT = 20
+DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "output.csv"
 
 
 def _row(label: str, value: str) -> str:
@@ -191,6 +194,18 @@ def show_forecast(dataset_root: Path | None, request_id: str) -> int:
     return 0
 
 
+def predict(dataset_root: Path | None, output_path: Path) -> int:
+    """Write one recommendation per evaluation request to ``output_path``."""
+    try:
+        dataset = load_dataset(dataset_root)
+    except DatasetError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    rows = write_predictions(dataset, output_path)
+    print(f"wrote {len(rows)} rows to {output_path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="main.py",
@@ -228,6 +243,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the baseline 90-day cash ledger for one request and exit",
     )
     parser.add_argument(
+        "--predict",
+        nargs="?",
+        type=Path,
+        const=DEFAULT_OUTPUT,
+        default=None,
+        metavar="PATH",
+        help=f"write predictions for every request (default path: {DEFAULT_OUTPUT.name} at the repo root)",
+    )
+    parser.add_argument(
         "--max-issues",
         type=int,
         default=DEFAULT_ISSUE_LIMIT,
@@ -246,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
         except DatasetError as error:
             print(str(error), file=sys.stderr)
             return 1
+    if args.predict:
+        return predict(dataset_root, args.predict)
     if args.forecast:
         return show_forecast(dataset_root, args.forecast)
     return run_validation(dataset_root, args.check_output, args.max_issues)

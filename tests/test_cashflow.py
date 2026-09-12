@@ -76,16 +76,16 @@ class HorizonTests(ForecastTestCase):
             self.assertEqual(entry.balance_after, balance)
         self.assertEqual(forecast.closing_balance, balance)
 
-    def test_entries_are_chronological_with_debits_first(self):
+    def test_entries_are_chronological_with_credits_first(self):
         forecast = self.forecast(
+            event(event_id="event_out", amount="70"),
             event(event_id="event_in", direction="credit", event_type="income",
                   category="salary", amount="500", status="scheduled"),
-            event(event_id="event_out", amount="70"),
         )
         days = [entry.day for entry in forecast.entries]
         self.assertEqual(days, sorted(days))
         same_day = forecast.entries_on(date(2026, 1, 10))
-        self.assertEqual([entry.source_id for entry in same_day], ["event_out", "event_in"])
+        self.assertEqual([entry.source_id for entry in same_day], ["event_in", "event_out"])
 
     def test_events_beyond_the_horizon_are_not_booked(self):
         beyond = REQUEST_DATE + timedelta(days=HORIZON_DAYS + 1)
@@ -864,6 +864,90 @@ class RealDatasetIncomeStreams(unittest.TestCase):
                 if entry.source_id == source_id
             }
             self.assertEqual(len(amounts), 1, source_id)
+
+
+class LedgerBoundaryTests(ForecastTestCase):
+    """Occurrences due on the request date, and one booked pay per cycle."""
+
+    def monthly(self, prefix, day_of_month=5, **overrides):
+        """Four settled monthly rows, Sep-Dec 2025, so the next is due 2026-01-05."""
+        return [
+            event(event_id=f"{prefix}_{month}", event_date=f"2025-{month:02d}-{day_of_month:02d}",
+                  settlement_date=f"2025-{month:02d}-{day_of_month:02d}", **overrides)
+            for month in (9, 10, 11, 12)
+        ]
+
+    def salary(self, **overrides):
+        fields = dict(direction="credit", event_type="income", category="salary",
+                      description="Primary salary", amount="500")
+        fields.update(overrides)
+        return self.monthly("event_pay", **fields)
+
+    def scheduled_pay(self, event_id, day):
+        return event(event_id=event_id, direction="credit", event_type="income",
+                     category="salary", description="Next confirmed salary", amount="500",
+                     status="scheduled", event_date=day, settlement_date=day)
+
+    def only(self, *rows):
+        return self.forecast(tables={"financial_events": list(rows), "images": []})
+
+    def test_debit_due_on_request_date_is_reserved(self):
+        forecast = self.only(*self.monthly("event_gym", category="gym", amount="60"))
+        days = [entry.day for entry in self.entries_for(forecast, "gym/debit")]
+        self.assertEqual(days[0], REQUEST_DATE)
+
+    def test_settled_row_on_request_date_is_not_projected_again(self):
+        rows = self.monthly("event_gym", category="gym", amount="60")
+        rows.append(event(event_id="event_gym_today", category="gym", amount="60",
+                          event_date="2026-01-05", settlement_date="2026-01-05"))
+        forecast = self.only(*rows)
+        self.assertEqual(forecast.entries_on(REQUEST_DATE), ())
+        self.assertEqual(self.entries_for(forecast, "gym/debit")[0].day, date(2026, 2, 5))
+
+    def test_salary_due_on_request_date_funds_a_payment_once(self):
+        from engine import amount_safe_to_pay, simulate
+
+        forecast = self.only(*self.salary())
+        self.assertEqual(len(forecast.entries_on(REQUEST_DATE)), 1)
+        # Opening 1000 + one 500 salary - floor 200.
+        self.assertEqual(amount_safe_to_pay(forecast, Decimal("5000")), Decimal("1300"))
+        self.assertFalse(simulate(forecast, [(REQUEST_DATE, Decimal("1300.01"))])[0])
+
+    def test_booked_pay_replaces_a_differently_named_projection(self):
+        forecast = self.only(*self.salary(), self.scheduled_pay("event_next", "2026-01-05"))
+        self.assertEqual([e.source_id for e in forecast.entries_on(REQUEST_DATE)], ["event_next"])
+        [note] = forecast.notes
+        self.assertEqual(note.source_id, "salary/credit/Primary salary")
+        self.assertIn("event_next", note.reason)
+        self.assertIn("2026-01-05", note.reason)
+
+    def test_booked_pay_outside_the_window_suppresses_nothing(self):
+        forecast = self.only(*self.salary(), self.scheduled_pay("event_next", "2026-01-20"))
+        projected = [e.day for e in self.entries_for(forecast, "salary/credit/Primary salary")]
+        self.assertEqual(projected[:2], [date(2026, 1, 5), date(2026, 2, 5)])
+        self.assertEqual(forecast.notes, ())
+
+    def test_each_booked_credit_suppresses_at_most_one_occurrence(self):
+        forecast = self.only(
+            *self.salary(),
+            self.scheduled_pay("event_a1", "2026-01-05"),
+            self.scheduled_pay("event_a2", "2026-01-06"),
+            self.scheduled_pay("event_b", "2026-02-05"),
+        )
+        projected = [e.day for e in self.entries_for(forecast, "salary/credit/Primary salary")]
+        self.assertEqual(projected, [date(2026, 3, 5), date(2026, 4, 5)])
+        self.assertEqual(len(forecast.notes), 2)
+        self.assertEqual(len([e for e in forecast.entries if e.source_kind == "event"]), 3)
+
+    def test_debit_overlap_window_is_unchanged(self):
+        rows = self.monthly("event_gym", category="gym", amount="60")
+        rows.append(event(event_id="event_gym_bill", category="gym", amount="75",
+                          status="pending", event_date="2026-02-01", settlement_date="2026-02-08"))
+        forecast = self.only(*rows)
+        days = [entry.day for entry in self.entries_for(forecast, "gym/debit")]
+        self.assertIn(REQUEST_DATE, days)
+        self.assertNotIn(date(2026, 2, 5), days)
+        self.assertEqual(forecast.notes, ())
 
 
 if __name__ == "__main__":
