@@ -49,7 +49,7 @@ python3 code/main.py --check-output output.csv    # also validate generated pred
 python3 -m unittest discover -s tests -v          # test suite (standard library only)
 ```
 
-After running your solution, confirm that `output.csv` exists in the repository root and contains the required columns and one row for every request. `--check-output` checks exactly that, plus the allowed values, plan formats and `0 <= amount_safe_to_pay <= requested_amount` bound for every row.
+After running your solution, confirm that `output.csv` exists in the repository root and contains the required columns and one row for every request. `--check-output` checks exactly that, plus the allowed values, plan formats and `0 <= amount_safe_to_pay <= requested_amount` bound for every row, and then the semantic rules: the plan must match the recommended method (one full payment on `request_date` for `full_payment`, one on `earliest_date_for_full_payment` for `wait`, a supplied option's exact schedule for `installments`), recommended methods must be ones the user accepts, and spending changes must target flexible, permitted expenses whose recurrence is supported by settled history.
 
 ## Important File Locations
 

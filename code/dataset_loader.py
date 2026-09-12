@@ -175,13 +175,21 @@ def parse_datetime(value: str | None, column: str) -> datetime:
 
 
 def parse_optional_decimal(value: str | None, column: str) -> Decimal | None:
+    """Parse a money field. Blank stays ``None``; NaN and infinities are errors.
+
+    Non-finite values would silently poison every comparison in the forecast,
+    so they are rejected at the boundary rather than carried forward.
+    """
     text = parse_text(value).replace(",", "")
     if not text:
         return None
     try:
-        return Decimal(text)
+        parsed = Decimal(text)
     except InvalidOperation as exc:
         raise ValueError(f"'{column}' is not a number: {value!r}") from exc
+    if not parsed.is_finite():
+        raise ValueError(f"'{column}' is not a finite number: {value!r}")
+    return parsed
 
 
 def parse_decimal(value: str | None, column: str) -> Decimal:
@@ -192,13 +200,19 @@ def parse_decimal(value: str | None, column: str) -> Decimal:
 
 
 def parse_optional_int(value: str | None, column: str) -> int | None:
+    """Parse a count field. Fractional input is an error, never truncated."""
     text = parse_text(value)
     if not text:
         return None
     try:
-        return int(Decimal(text))
-    except (InvalidOperation, ValueError) as exc:
+        parsed = Decimal(text)
+    except InvalidOperation as exc:
         raise ValueError(f"'{column}' is not an integer: {value!r}") from exc
+    if not parsed.is_finite():
+        raise ValueError(f"'{column}' is not a finite number: {value!r}")
+    if parsed != parsed.to_integral_value():
+        raise ValueError(f"'{column}' is not a whole number: {value!r}")
+    return int(parsed)
 
 
 def parse_int(value: str | None, column: str) -> int:

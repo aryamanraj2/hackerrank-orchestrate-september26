@@ -273,6 +273,40 @@ class UnparsableRowsFailFast(DatasetValidationCase):
         self.assertEqual(issue.line, 1)
         self.assertIn("missing required column(s): requested_amount", issue.message)
 
+    def test_non_finite_money_in_a_csv(self) -> None:
+        for text in ("NaN", "Infinity", "-Infinity"):
+            tables = default_tables()
+            tables["financial_events"][0]["amount"] = text
+            error = self._expect_error(tables)
+            issue = error.issues[0]
+            self.assertEqual(issue.source, "dataset/financial_events.csv")
+            self.assertEqual(issue.identifier, "event_a")
+            self.assertIn("not a finite number", issue.message)
+
+    def test_non_finite_requested_amount(self) -> None:
+        tables = default_tables()
+        tables["requests"][0]["requested_amount"] = "NaN"
+        error = self._expect_error(tables)
+        self.assertIn("requested_amount", str(error))
+        self.assertIn("not a finite number", str(error))
+
+    def test_fractional_number_of_payments_is_not_truncated(self) -> None:
+        tables = default_tables()
+        tables["request_payment_options"][1]["number_of_payments"] = "2.5"
+        error = self._expect_error(tables)
+        issue = error.issues[0]
+        self.assertEqual(issue.source, "dataset/request_payment_options.csv")
+        self.assertEqual(issue.identifier, "payment_option_02")
+        self.assertIn("number_of_payments", issue.message)
+        self.assertIn("not a whole number", issue.message)
+
+    def test_fractional_max_installment_months(self) -> None:
+        tables = default_tables()
+        tables["financial_profiles"][0]["max_installment_months"] = "6.5"
+        error = self._expect_error(tables)
+        self.assertIn("max_installment_months", str(error))
+        self.assertIn("not a whole number", str(error))
+
     def test_missing_file_is_reported(self) -> None:
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)

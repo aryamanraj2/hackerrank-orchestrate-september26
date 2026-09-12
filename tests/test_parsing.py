@@ -41,6 +41,36 @@ class ParseOptionalValues(unittest.TestCase):
         self.assertEqual(parse_list(" rent | groceries "), ("rent", "groceries"))
 
 
+class RejectNonFiniteAndFractional(unittest.TestCase):
+    def test_non_finite_money_is_rejected(self) -> None:
+        for text in ("NaN", "nan", "sNaN", "Infinity", "-Infinity", "inf", "-inf"):
+            with self.assertRaises(ValueError, msg=text) as ctx:
+                parse_optional_decimal(text, "amount")
+            self.assertIn("not a finite number", str(ctx.exception))
+            self.assertIn("amount", str(ctx.exception))
+
+    def test_non_finite_money_is_rejected_for_required_fields(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            parse_decimal("Infinity", "requested_amount")
+        self.assertIn("not a finite number", str(ctx.exception))
+
+    def test_fractional_integer_is_rejected_not_truncated(self) -> None:
+        for text in ("2.5", "-0.5", "0.0001", "30.000001"):
+            with self.assertRaises(ValueError, msg=text) as ctx:
+                parse_optional_int(text, "number_of_payments")
+            self.assertIn("not a whole number", str(ctx.exception))
+            self.assertIn("number_of_payments", str(ctx.exception))
+
+    def test_non_finite_integer_is_rejected(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            parse_optional_int("NaN", "max_installment_months")
+        self.assertIn("not a finite number", str(ctx.exception))
+
+    def test_integral_values_are_still_accepted(self) -> None:
+        self.assertEqual(parse_optional_int("3", "number_of_payments"), 3)
+        self.assertEqual(parse_optional_int("30.0", "payment_frequency_days"), 30)
+
+
 class ParseRequiredValues(unittest.TestCase):
     def test_decimal_keeps_exact_precision(self) -> None:
         self.assertEqual(parse_decimal("1475.46", "amount"), Decimal("1475.46"))

@@ -8,7 +8,7 @@ predictions are written.
 
     python3 code/main.py               # dataset summary + contract validation
     python3 code/main.py --validate    # same, stated explicitly
-    python3 code/main.py --check-output output.csv
+    python3 code/main.py --check-output output.csv   # + semantic recommendation checks
 """
 
 from __future__ import annotations
@@ -21,10 +21,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dataset_loader import Dataset, find_dataset_root, load_dataset  # noqa: E402
-from output_schema import (  # noqa: E402
-    REQUIRED_OUTPUT_COLUMNS,
-    validate_output_file,
-    validate_output_row_values,
+from output_schema import REQUIRED_OUTPUT_COLUMNS, validate_output_row_values  # noqa: E402
+from recommendation_schema import (  # noqa: E402
+    validate_predictions_file,
+    validate_recommendation,
 )
 from validation import DatasetError, ValidationIssue, data_line, format_issues  # noqa: E402
 
@@ -96,19 +96,21 @@ def summarise(dataset: Dataset) -> str:
 
 
 def check_sample_outputs(dataset: Dataset) -> list[ValidationIssue]:
-    """Run the output validator over the solved examples as a self-check."""
+    """Run both validators over the solved examples as a self-check."""
     path = dataset.root / "sample_requests.csv"
+    source = "dataset/sample_requests.csv"
     issues: list[ValidationIssue] = []
     with path.open(newline="", encoding="utf-8") as handle:
         for index, row in enumerate(csv.DictReader(handle)):
             sample = dataset.sample_request_by_id.get((row.get("request_id") or "").strip())
             if sample is None:
                 continue
+            line = data_line(index)
             issues += validate_output_row_values(
-                row,
-                sample.request,
-                source="dataset/sample_requests.csv",
-                line=data_line(index),
+                row, sample.request, source=source, line=line
+            )
+            issues += validate_recommendation(
+                row, sample.request, dataset, source=source, line=line
             )
     return issues
 
@@ -146,15 +148,16 @@ def run_validation(dataset_root: Path | None, output_path: Path | None, issue_li
     sample_issues = check_sample_outputs(dataset)
     print(
         f"{'FAIL' if sample_issues else 'OK  '} solved examples satisfy the output value "
-        f"contract ({len(dataset.sample_requests)} rows)"
+        f"and recommendation contracts ({len(dataset.sample_requests)} rows)"
     )
     if sample_issues:
         failures.append(("sample_requests", sample_issues))
 
     if output_path is not None:
-        output_issues = validate_output_file(output_path, dataset.requests)
+        output_issues = validate_predictions_file(output_path, dataset)
         print(
-            f"{'FAIL' if output_issues else 'OK  '} {output_path} satisfies the output contract"
+            f"{'FAIL' if output_issues else 'OK  '} {output_path} satisfies the output "
+            "and recommendation contracts"
         )
         if output_issues:
             failures.append((str(output_path), output_issues))
@@ -194,7 +197,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         metavar="PATH",
-        help="additionally validate a generated output.csv against the requests",
+        help=(
+            "additionally validate a generated output.csv against the requests, "
+            "including the semantic recommendation checks"
+        ),
     )
     parser.add_argument(
         "--max-issues",

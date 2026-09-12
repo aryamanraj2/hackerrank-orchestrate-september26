@@ -137,20 +137,23 @@ def validate_output_request_ids(
 
 
 def _decimal(value: str) -> Decimal | None:
+    """Parse a money cell, returning ``None`` for blank, junk or non-finite."""
     text = (value or "").strip().replace(",", "")
     if not text:
         return None
     try:
-        return Decimal(text)
+        parsed = Decimal(text)
     except InvalidOperation:
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def parse_payment_plan(value: str) -> tuple[tuple[date, Decimal], ...]:
     """Parse ``YYYY-MM-DD:amount|...`` into dated payments.
 
     Returns an empty tuple for ``none``. Raises :class:`ValueError` when the
-    format, a date or an amount is invalid.
+    format, a date or an amount is invalid. Every listed payment is an actual
+    transfer, so amounts must be finite and strictly positive.
     """
     text = (value or "").strip()
     if text == "" or text == NO_PAYMENT_PLAN:
@@ -167,7 +170,13 @@ def parse_payment_plan(value: str) -> tuple[tuple[date, Decimal], ...]:
             raise ValueError(f"payment_plan entry has an invalid date: {part!r}") from exc
         amount = _decimal(amount_text)
         if amount is None:
-            raise ValueError(f"payment_plan entry has an invalid amount: {part!r}")
+            raise ValueError(
+                f"payment_plan entry has an invalid or non-finite amount: {part!r}"
+            )
+        if amount <= 0:
+            raise ValueError(
+                f"payment_plan entry must be strictly positive: {part!r}"
+            )
         payments.append((when, amount))
     return tuple(payments)
 
@@ -189,7 +198,11 @@ def parse_spending_changes(value: str) -> tuple[tuple[str, str, Decimal | None],
         elif fields[0] == "reduce_to" and len(fields) == 3 and fields[1]:
             amount = _decimal(fields[2])
             if amount is None:
-                raise ValueError(f"reduce_to has an invalid amount: {part!r}")
+                raise ValueError(
+                    f"reduce_to has an invalid or non-finite amount: {part!r}"
+                )
+            if amount < 0:
+                raise ValueError(f"reduce_to amount cannot be negative: {part!r}")
             changes.append(("reduce_to", fields[1], amount))
         else:
             raise ValueError(
@@ -222,7 +235,10 @@ def validate_output_row_values(
 
     amount = _decimal(row.get("amount_safe_to_pay", ""))
     if amount is None:
-        add("amount_safe_to_pay is blank or not a number", "amount_safe_to_pay")
+        add(
+            "amount_safe_to_pay is blank, non-numeric or not finite",
+            "amount_safe_to_pay",
+        )
     elif amount < 0 or amount > request.requested_amount:
         add(
             f"amount_safe_to_pay {amount} is outside 0..{request.requested_amount}",
@@ -268,6 +284,12 @@ def validate_output_row_values(
         )
 
     if method == "partial_payment":
+        if earliest is None:
+            add(
+                "partial_payment requires a valid earliest_date_for_full_payment "
+                "for the second payment",
+                "earliest_date_for_full_payment",
+            )
         if status != "affordable_with_plan":
             add(
                 "partial_payment requires affordability_status 'affordable_with_plan'",
@@ -301,9 +323,10 @@ def validate_output_row_values(
                     f"({request.requested_amount})",
                     "payment_plan",
                 )
-            if earliest is not None and second_date != earliest:
+            if second_date != earliest:
                 add(
-                    "second partial payment must fall on earliest_date_for_full_payment",
+                    "second partial payment must fall on "
+                    f"earliest_date_for_full_payment ({earliest_text or 'blank'})",
                     "payment_plan",
                 )
             if second_date > request.desired_completion_date:

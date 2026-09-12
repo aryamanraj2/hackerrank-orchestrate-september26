@@ -115,7 +115,16 @@ class PlanParsing(unittest.TestCase):
         )
 
     def test_bad_entries_raise(self) -> None:
-        for text in ("2026-01-05", "05-01-2026:100", "2026-01-05:many", "2026-01-05:1:2"):
+        for text in (
+            "2026-01-05",
+            "05-01-2026:100",
+            "2026-01-05:many",
+            "2026-01-05:1:2",
+            "2026-01-05:NaN",
+            "2026-01-05:Infinity",
+            "2026-01-05:0",
+            "2026-01-05:-1",
+        ):
             with self.assertRaises(ValueError, msg=text):
                 parse_payment_plan(text)
 
@@ -125,7 +134,14 @@ class PlanParsing(unittest.TestCase):
             parse_spending_changes("stop:event_14|reduce_to:event_21:100"),
             (("stop", "event_14", None), ("reduce_to", "event_21", Decimal(100))),
         )
-        for text in ("stop", "pause:event_1", "reduce_to:event_1", "reduce_to:event_1:x"):
+        for text in (
+            "stop",
+            "pause:event_1",
+            "reduce_to:event_1",
+            "reduce_to:event_1:x",
+            "reduce_to:event_1:NaN",
+            "reduce_to:event_1:-5",
+        ):
             with self.assertRaises(ValueError, msg=text):
                 parse_spending_changes(text)
 
@@ -142,7 +158,63 @@ class RowValues(unittest.TestCase):
 
     def test_blank_amount_is_rejected(self) -> None:
         issues = validate_output_row_values(output_row(amount_safe_to_pay=""), make_request())
-        self.assertIn("blank or not a number", issues[0].message)
+        self.assertIn("blank, non-numeric or not finite", issues[0].message)
+
+    def test_non_finite_amount_is_rejected(self) -> None:
+        for text in ("NaN", "Infinity", "-Infinity", "inf"):
+            issues = validate_output_row_values(
+                output_row(amount_safe_to_pay=text), make_request()
+            )
+            self.assertTrue(
+                any("not finite" in issue.message for issue in issues),
+                f"{text} should be rejected: {[str(i) for i in issues]}",
+            )
+
+    def test_non_positive_plan_amount_is_rejected(self) -> None:
+        for text in ("2026-01-05:0", "2026-01-05:-500"):
+            issues = validate_output_row_values(
+                output_row(payment_plan=text), make_request()
+            )
+            self.assertTrue(
+                any("strictly positive" in issue.message for issue in issues),
+                f"{text} should be rejected: {[str(i) for i in issues]}",
+            )
+
+    def test_non_finite_plan_amount_is_rejected(self) -> None:
+        issues = validate_output_row_values(
+            output_row(payment_plan="2026-01-05:NaN"), make_request()
+        )
+        self.assertTrue(any("non-finite" in issue.message for issue in issues))
+
+    def test_partial_payment_requires_an_earliest_date(self) -> None:
+        issues = validate_output_row_values(
+            output_row(
+                amount_safe_to_pay="200",
+                affordability_status="affordable_with_plan",
+                recommended_payment_method="partial_payment",
+                payment_plan="2026-01-05:200|2026-01-20:300",
+                earliest_date_for_full_payment="",
+            ),
+            make_request(),
+        )
+        messages = " ".join(issue.message for issue in issues)
+        self.assertIn("partial_payment requires a valid earliest_date_for_full_payment", messages)
+        self.assertIn("second partial payment must fall on", messages)
+
+    def test_partial_payment_second_date_must_equal_earliest_date(self) -> None:
+        issues = validate_output_row_values(
+            output_row(
+                amount_safe_to_pay="200",
+                affordability_status="affordable_with_plan",
+                recommended_payment_method="partial_payment",
+                payment_plan="2026-01-05:200|2026-01-25:300",
+                earliest_date_for_full_payment="2026-01-20",
+            ),
+            make_request(),
+        )
+        self.assertTrue(
+            any("earliest_date_for_full_payment (2026-01-20)" in issue.message for issue in issues)
+        )
 
     def test_unknown_status_and_method(self) -> None:
         issues = validate_output_row_values(
