@@ -35,13 +35,21 @@ Your solution must:
 - Generate one prediction for every request
 - Write the final predictions to `output.csv` in the repository root
 
-Run the starter Python entry point with:
+Run the Python entry point with:
 
 ```bash
 python3 code/main.py
 ```
 
-After running your solution, confirm that `output.csv` exists in the repository root and contains the required columns and one row for every request.
+Today the entry point is the data foundation: it loads and indexes every file in `dataset/`, validates the schemas, referential integrity and the eight-column output contract, prints a compact summary, and exits non-zero on any violation. The affordability decision engine is not wired in yet, so it does not write predictions.
+
+```bash
+python3 code/main.py --validate                  # dataset summary + contract validation
+python3 code/main.py --check-output output.csv    # also validate generated predictions
+python3 -m unittest discover -s tests -v          # test suite (standard library only)
+```
+
+After running your solution, confirm that `output.csv` exists in the repository root and contains the required columns and one row for every request. `--check-output` checks exactly that, plus the allowed values, plan formats and `0 <= amount_safe_to_pay <= requested_amount` bound for every row.
 
 ## Important File Locations
 
