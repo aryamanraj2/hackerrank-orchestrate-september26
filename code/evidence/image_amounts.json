@@ -1,0 +1,185 @@
+{
+  "prompt_version": "image-amount-v2",
+  "model": "gemini-3.8-flash-high",
+  "backend": "agy",
+  "agy_version": "1.2.2",
+  "generated_at": "2026-09-12T21:07:55+00:00",
+  "records": [
+    {
+      "image_id": "image_01",
+      "event_id": "event_253",
+      "image_sha256": "f37b40e6af42c664846057252cac89ad41b7d029dfe8dacff2db8cceb79fa5ba",
+      "status": "resolved",
+      "amount": "4365000",
+      "currency": "IDR",
+      "field_label": "Net Pay",
+      "selection_rationale": "The event records the August 2019 net salary, which corresponds to the Net Pay of 4,365,000 IDR on the August 2019 pay slip after subtracting total deductions from total earnings.",
+      "reason": ""
+    },
+    {
+      "image_id": "image_02",
+      "event_id": "event_1442",
+      "image_sha256": "ccd779e5382b1bcfacfb47d4ccf346ffd667a34c8b94d0cfd48aa4a609bd117d",
+      "status": "resolved",
+      "amount": "100000.00",
+      "currency": "INR",
+      "field_label": "Balance Due:",
+      "selection_rationale": "The event specifies an outstanding rent balance, which matches the 'Balance Due:' amount of 1,00,000.00 remaining to be paid on the rent receipt.",
+      "reason": ""
+    },
+    {
+      "image_id": "image_03",
+      "event_id": "event_1545",
+      "image_sha256": "e5fb0bbcda6cc06f8ea95e32e45d4c76acd8c594f4b02ff0d78e6006e103ee4d",
+      "status": "resolved",
+      "amount": "41272.0",
+      "currency": "INR",
+      "field_label": "Net Amount:",
+      "selection_rationale": "This figure represents the net amount actually charged for the bulk groceries and pantry purchase on 2026-02-27, matching the settled debit transaction.",
+      "reason": ""
+    },
+    {
+      "image_id": "image_04",
+      "event_id": "event_1700",
+      "image_sha256": "281e7f1e7bd1f98fbd53cde1381977373e610e6634b11c98098000001ff10f0c",
+      "status": "unresolved",
+      "amount": null,
+      "currency": "INR",
+      "field_label": "",
+      "selection_rationale": "",
+      "reason": "The total amount for the delivered grocery order is cut off at the bottom of the document and not fully visible. The only fully visible figure is the partial subtotal 'Item Bill', which cannot be used as the final amount."
+    },
+    {
+      "image_id": "image_05",
+      "event_id": "event_1786",
+      "image_sha256": "9abcda5647afb3dcdf91613253ac0160bd722333af33a4b952dfc96fea6ff97b",
+      "status": "resolved",
+      "amount": "822.05",
+      "currency": "INR",
+      "field_label": "Amount due after 06-Feb-2026",
+      "selection_rationale": "The event's settlement date is 2026-02-09, which is after the due date of 06-Feb-2026, so the date-dependent amount due after the due date (822.05 INR) applies.",
+      "reason": ""
+    },
+    {
+      "image_id": "image_06",
+      "event_id": "event_3051",
+      "image_sha256": "9055551fbe5940feb01b947e1f18ccfed093192d103b1e930a56df0ea7cd3cb4",
+      "status": "resolved",
+      "amount": "1995.00",
+      "currency": "INR",
+      "field_label": "Total",
+      "selection_rationale": "This figure represents the final total payable amount on the grocery tax invoice, matching the settled debit transaction for grocery items.",
+      "reason": ""
+    },
+    {
+      "image_id": "image_07",
+      "event_id": "event_3231",
+      "image_sha256": "f6d30a74355224c0b5cda2d7f96399a7b1a0afe4f9fe59ea048bbecb1a21311e",
+      "status": "resolved",
+      "amount": "8528",
+      "currency": "INR",
+      "field_label": "Grand Total (RS)",
+      "selection_rationale": "This figure represents the final grand total charged and settled for the dining invoice, rounded to the nearest rupee as printed on the receipt.",
+      "reason": ""
+    },
+    {
+      "image_id": "image_08",
+      "event_id": "event_4535",
+      "image_sha256": "e28592ad8b4dacd03055e0b1ebc46670c83fbfa1162af07bdef33bb226bf63c8",
+      "status": "resolved",
+      "amount": "15339.00",
+      "currency": "INR",
+      "field_label": "Total Amount Received",
+      "selection_rationale": "The total amount received reflects the settled total of the property maintenance bill (Invoice No. 6455), combining the flat maintenance, clubhouse, and infrastructure line items.",
+      "reason": ""
+    },
+    {
+      "image_id": "image_09",
+      "event_id": "event_5170",
+      "image_sha256": "e0e74e14425d923ff8a5c6db26ec6f4f26ee4697bfd257e414ba05c947a75ba8",
+      "status": "resolved",
+      "amount": "723.00",
+      "currency": "INR",
+      "field_label": "Total Amount Received",
+      "selection_rationale": "The receipt confirms a total payment of 723.00 INR received on 07-06-2026 for the water bill, matching the settled utility debit event.",
+      "reason": ""
+    },
+    {
+      "image_id": "image_10",
+      "event_id": "event_6033",
+      "image_sha256": "c90f98caf0877083e471fd47dace772f83d4782037cf112e97c63f79a10ea8cf",
+      "status": "resolved",
+      "amount": "79679.26",
+      "currency": "INR",
+      "field_label": "Total",
+      "selection_rationale": "The event describes a grocery tax invoice, and 'Total' represents the full invoice amount including applicable taxes for all grocery items.",
+      "reason": ""
+    },
+    {
+      "image_id": "image_11",
+      "event_id": "event_6859",
+      "image_sha256": "795e000d48428c97748e8af370cb02b604bec88cc52ec8930f38dc744624e886",
+      "status": "resolved",
+      "amount": "3650.00",
+      "currency": "INR",
+      "field_label": "Amount Payable",
+      "selection_rationale": "The event describes a hospital bill payable, which matches the Amount Payable figure of 3650.00 INR shown on the Jeevan Hospital provisional bill.",
+      "reason": ""
+    },
+    {
+      "image_id": "image_12",
+      "event_id": "event_7307",
+      "image_sha256": "e10b0123e66d512d82f6c431fb741053b336627b89b9d9a138071ac6980a14ff",
+      "status": "resolved",
+      "amount": "33.50",
+      "currency": "USD",
+      "field_label": "Total:",
+      "selection_rationale": "The event describes a settled taxi fare debit, which corresponds to the total trip cost of 33.50 USD rather than the cash tendered or change returned.",
+      "reason": ""
+    },
+    {
+      "image_id": "image_13",
+      "event_id": "event_7941",
+      "image_sha256": "1ae54b378a9556d94b753093ba80e7117caf86fab4d3fe11ec84e3dd2f6d6dd8",
+      "status": "resolved",
+      "amount": "2298",
+      "currency": "INR",
+      "field_label": "Total paid",
+      "selection_rationale": "The event describes a settled debit for a tote bag order, which matches the final 'Total paid' figure of ₹2,298 for the order.",
+      "reason": ""
+    },
+    {
+      "image_id": "image_14",
+      "event_id": "event_9421",
+      "image_sha256": "bf88e4aa35e6f36304cbf76bf6f505f32b04466bfd5f7df693fcb3ebe8a3e2c1",
+      "status": "resolved",
+      "amount": "4543",
+      "currency": "INR",
+      "field_label": "TOTAL",
+      "selection_rationale": "The receipt lists healthcare items with a total amount of 4543 INR under the TOTAL label, matching the settled pharmacy purchase event.",
+      "reason": ""
+    },
+    {
+      "image_id": "image_15",
+      "event_id": "event_9806",
+      "image_sha256": "0c0fe3d79e670f2b423bbb2aafc0b5601d3eb4e659ac64058cd189abf7792ee1",
+      "status": "resolved",
+      "amount": "9968.00",
+      "currency": "INR",
+      "field_label": "Grand Total",
+      "selection_rationale": "The grand total of 9,968.00 represents the total settled amount for the airline ticket purchase, including air travel charges, airport charges, and all applicable taxes.",
+      "reason": ""
+    },
+    {
+      "image_id": "image_16",
+      "event_id": "event_10521",
+      "image_sha256": "2665cf731a861ddb217be5b8082fbd390850a7a98feec018519b6fda0b30b4f8",
+      "status": "resolved",
+      "amount": "393.22",
+      "currency": "INR",
+      "field_label": "Total",
+      "selection_rationale": "The figure represents the total amount debited via wallet for the EV charging session on 2026-09-03, including the base energy charge and taxes (CGST and SGST).",
+      "reason": ""
+    }
+  ]
+}

@@ -1,0 +1,176 @@
+{
+  "prompt_version": "image-amount-v2",
+  "model": "gemini-3.8-flash-high",
+  "backend": "agy",
+  "agy_version": "1.2.2",
+  "calls": [
+    {
+      "image_id": "image_01",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 127390,
+      "output_tokens": 11019,
+      "thinking_tokens": 9294,
+      "cache_read_tokens": 740569,
+      "total_tokens": 138409,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_02",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 219784,
+      "output_tokens": 25618,
+      "thinking_tokens": 22335,
+      "cache_read_tokens": 1848682,
+      "total_tokens": 245402,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_03",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 152357,
+      "output_tokens": 19339,
+      "thinking_tokens": 17140,
+      "cache_read_tokens": 1034062,
+      "total_tokens": 171696,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_04",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 206832,
+      "output_tokens": 17286,
+      "thinking_tokens": 14193,
+      "cache_read_tokens": 1508400,
+      "total_tokens": 224118,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_05",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 96779,
+      "output_tokens": 11014,
+      "thinking_tokens": 9591,
+      "cache_read_tokens": 459947,
+      "total_tokens": 107793,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_06",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 106368,
+      "output_tokens": 11956,
+      "thinking_tokens": 10524,
+      "cache_read_tokens": 504772,
+      "total_tokens": 118324,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_07",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 116920,
+      "output_tokens": 14803,
+      "thinking_tokens": 13043,
+      "cache_read_tokens": 749290,
+      "total_tokens": 131723,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_08",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 100868,
+      "output_tokens": 11148,
+      "thinking_tokens": 9726,
+      "cache_read_tokens": 524940,
+      "total_tokens": 112016,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_09",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 187646,
+      "output_tokens": 27449,
+      "thinking_tokens": 24188,
+      "cache_read_tokens": 1933986,
+      "total_tokens": 215095,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_10",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 111485,
+      "output_tokens": 11359,
+      "thinking_tokens": 10110,
+      "cache_read_tokens": 386631,
+      "total_tokens": 122844,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_11",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 215880,
+      "output_tokens": 24442,
+      "thinking_tokens": 21386,
+      "cache_read_tokens": 1599936,
+      "total_tokens": 240322,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_12",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 225181,
+      "output_tokens": 10999,
+      "thinking_tokens": 8894,
+      "cache_read_tokens": 915453,
+      "total_tokens": 236180,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_13",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 69938,
+      "output_tokens": 7880,
+      "thinking_tokens": 6759,
+      "cache_read_tokens": 284547,
+      "total_tokens": 77818,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_14",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 256336,
+      "output_tokens": 32714,
+      "thinking_tokens": 28922,
+      "cache_read_tokens": 2112493,
+      "total_tokens": 289050,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_15",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 205116,
+      "output_tokens": 17603,
+      "thinking_tokens": 14579,
+      "cache_read_tokens": 1595137,
+      "total_tokens": 222719,
+      "usage_source": "agy usage"
+    },
+    {
+      "image_id": "image_16",
+      "model": "gemini-3.8-flash-high",
+      "input_tokens": 104643,
+      "output_tokens": 9385,
+      "thinking_tokens": 7944,
+      "cache_read_tokens": 528821,
+      "total_tokens": 114028,
+      "usage_source": "agy usage"
+    }
+  ],
+  "totals": {
+    "input_tokens": 2503523,
+    "output_tokens": 264014,
+    "thinking_tokens": 228628,
+    "cache_read_tokens": 16727666,
+    "total_tokens": 2767537,
+    "calls": 16
+  }
+}
