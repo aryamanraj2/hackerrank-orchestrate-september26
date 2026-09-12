@@ -25,6 +25,10 @@ from typing import Iterable, Mapping, Sequence
 #: and unrealized rows never moved cash at all.
 HISTORICAL_STATUSES = frozenset({"settled"})
 
+#: Only earned income is split into streams; every other credit keeps the
+#: category-level grouping.
+INCOME_EVENT_TYPES = frozenset({"income"})
+
 #: A pair of dates is a coincidence; three give two intervals to compare.
 MIN_OCCURRENCES = 3
 
@@ -68,6 +72,10 @@ class RecurrencePattern:
     #: ``month_day`` is set.
     cadence_cycle: tuple[int, ...]
     amounts: tuple[Decimal, ...]
+    #: The income stream these occurrences belong to: the supplied description
+    #: shared by every occurrence. Empty for debits, which stay grouped by
+    #: category alone.
+    stream: str = ""
     #: Day-of-month anchor when history settles on a calendar schedule (the
     #: 15th of consecutive months). ``31`` means "the last day of the month".
     #: Calendar projection keeps the real settlement day instead of drifting
@@ -202,6 +210,111 @@ def _alternating_cycle(gaps: Sequence[int]) -> tuple[int, int] | None:
     return medians[0], medians[1]
 
 
+def _gaps(dates: Sequence[date]) -> list[int]:
+    return [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
+
+
+def _cycle_for(
+    dates: Sequence[date], gaps: Sequence[int]
+) -> tuple[tuple[int, ...], int | None] | None:
+    """The repeating gap cycle and month anchor these dates support, or ``None``.
+
+    This is the whole of the cadence rule: a calendar-month anchor, a single
+    consistent interval, or an exact alternating cycle. Nothing else is a
+    recurring series.
+    """
+    if not gaps or any(gap <= 0 for gap in gaps):
+        return None
+    median = statistics.median(gaps)
+    month_day = _month_anchor(dates, gaps)
+    if month_day is not None or (
+        MIN_CADENCE_DAYS <= median <= MAX_CADENCE_DAYS
+        and _cadence_is_consistent(gaps, median)
+    ):
+        return (int(round(median)),), month_day
+    alternating = _alternating_cycle(gaps)
+    if alternating is None:
+        return None
+    return alternating, None
+
+
+def _month_anchored_chains(dates: Sequence[date]) -> Iterable[list[int]]:
+    """Index chains that settle on one day-of-month, one occurrence per month."""
+    for anchor in sorted({day.day for day in dates} | {31}):
+        chain: list[int] = []
+        months: set[tuple[int, int]] = set()
+        for index, day in enumerate(dates):
+            last_day = calendar.monthrange(day.year, day.month)[1]
+            month = (day.year, day.month)
+            if day.day == min(anchor, last_day) and month not in months:
+                months.add(month)
+                chain.append(index)
+        yield chain
+
+
+def _fixed_gap_chains(dates: Sequence[date], gaps: Sequence[int]) -> Iterable[list[int]]:
+    """Index chains that step through the dates at one observed interval.
+
+    Each observed gap is tried as the target interval from each possible
+    starting point, taking the closest date still inside tolerance at every
+    step. An occurrence that does not fit the interval is simply stepped over,
+    which is what separates a one-off from the series it landed inside.
+    """
+    for target in sorted({gap for gap in gaps if MIN_CADENCE_DAYS <= gap <= MAX_CADENCE_DAYS}):
+        tolerance = max(
+            CADENCE_TOLERANCE_DAYS, int(Decimal(target) * CADENCE_TOLERANCE_RATIO)
+        )
+        for start in range(len(dates)):
+            chain = [start]
+            current = start
+            while True:
+                nearest: tuple[int, int] | None = None
+                for candidate in range(current + 1, len(dates)):
+                    delta = (dates[candidate] - dates[current]).days
+                    if delta > target + tolerance:
+                        break
+                    if delta >= target - tolerance:
+                        score = abs(delta - target)
+                        if nearest is None or score < nearest[0]:
+                            nearest = (score, candidate)
+                if nearest is None:
+                    break
+                current = nearest[1]
+                chain.append(current)
+            yield chain
+
+
+def _dominant_subsequence(
+    dates: Sequence[date], min_occurrences: int
+) -> list[int] | None:
+    """The largest subsequence of ``dates`` that is a series in its own right.
+
+    A settled history can carry an occurrence that belongs to no schedule — a
+    one-off bonus paid between two payrolls, a correction settled days after
+    the run. Rejecting the whole category because of it would erase a
+    commitment the history plainly supports, so the supported occurrences are
+    kept and the rest are discarded. The retained dates must satisfy the same
+    cadence rules unaided; this never invents a series that is not there.
+    """
+    best: tuple[tuple, list[int]] | None = None
+    gaps = _gaps(dates)
+    chains = list(_month_anchored_chains(dates)) + list(_fixed_gap_chains(dates, gaps))
+    for chain in chains:
+        if len(chain) < min_occurrences or len(chain) == len(dates):
+            continue
+        picked = [dates[index] for index in chain]
+        classified = _cycle_for(picked, _gaps(picked))
+        if classified is None:
+            continue
+        cycle = classified[0]
+        # Longest wins; then the series that starts earliest, then the
+        # tightest cadence, so the choice never depends on iteration order.
+        key = (-len(chain), picked[0], sum(cycle) / len(cycle), tuple(chain))
+        if best is None or key < best[0]:
+            best = (key, chain)
+    return best[1] if best is not None else None
+
+
 def _cadence_is_consistent(gaps: Sequence[int], median: float) -> bool:
     tolerance = max(
         Decimal(CADENCE_TOLERANCE_DAYS), Decimal(str(median)) * CADENCE_TOLERANCE_RATIO
@@ -233,11 +346,28 @@ def _historical(
     return sorted(selected, key=lambda event: (evidence_date(event), event.event_id))
 
 
+def income_stream(event) -> str:
+    """The income stream an event belongs to, or ``""`` if it is not income.
+
+    Two pay sources can sit in the same category: a fixed monthly base and a
+    variable commission are both ``salary`` credits, but they are separate
+    commitments that arrive on their own schedule for their own amount, and
+    evidence can confirm one while withholding the other. The supplied
+    description is the only stream label the dataset gives, so it is the one
+    used — never a user id, and never a hand-written list of event ids.
+    Debits keep their category-level grouping untouched.
+    """
+    if event.direction != "credit" or event.event_type not in INCOME_EVENT_TYPES:
+        return ""
+    return event.description
+
+
 def detect_recurrence(
     events: Iterable,
     *,
     category: str,
     direction: str,
+    stream: str | None = None,
     as_of: date | None = None,
     statuses: frozenset[str] = HISTORICAL_STATUSES,
     min_occurrences: int = MIN_OCCURRENCES,
@@ -246,36 +376,36 @@ def detect_recurrence(
 
     ``events`` should be one user's events; ``as_of`` restricts the evidence to
     history on or before that date, so a decision made on `request_date` never
-    relies on events that had not happened yet.
+    relies on events that had not happened yet. ``stream`` narrows the series
+    to one income stream within the category; ``None`` keeps every occurrence,
+    which is what a debit category wants.
     """
     series = [
         event
         for event in _historical(events, as_of=as_of, statuses=statuses)
-        if event.category == category and event.direction == direction
+        if event.category == category
+        and event.direction == direction
+        and (stream is None or income_stream(event) == stream)
     ]
     if len(series) < min_occurrences:
         return None
 
     dates = [evidence_date(event) for event in series]
-    gaps = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
-    if not gaps or any(gap <= 0 for gap in gaps):
-        return None
-
-    median = statistics.median(gaps)
-    month_day = _month_anchor(dates, gaps)
-    cycle: tuple[int, ...]
-    if month_day is not None or (
-        MIN_CADENCE_DAYS <= median <= MAX_CADENCE_DAYS and _cadence_is_consistent(gaps, median)
-    ):
-        cycle = (int(round(median)),)
-    else:
-        alternating = _alternating_cycle(gaps)
-        if alternating is None:
+    gaps = _gaps(dates)
+    classified = _cycle_for(dates, gaps)
+    if classified is None:
+        keep = _dominant_subsequence(dates, min_occurrences)
+        if keep is None:
             return None
-        cycle = alternating
+        series = [series[index] for index in keep]
+        dates = [dates[index] for index in keep]
+        classified = _cycle_for(dates, _gaps(dates))
+        if classified is None:
+            return None
+    cycle, month_day = classified
     # Rotate so the first entry is the gap that follows the last observation:
     # the series resumes in the phase it actually left off in.
-    offset = len(gaps) % len(cycle)
+    offset = (len(dates) - 1) % len(cycle)
     cycle = cycle[offset:] + cycle[:offset]
 
     return RecurrencePattern(
@@ -286,6 +416,7 @@ def detect_recurrence(
         dates=tuple(dates),
         cadence_days=int(round(sum(cycle) / len(cycle))),
         cadence_cycle=cycle,
+        stream=stream or "",
         month_day=month_day,
         amounts=tuple(event.amount for event in series if event.amount is not None),
     )
@@ -316,13 +447,45 @@ def recurrence_patterns(
     as_of: date | None = None,
     statuses: frozenset[str] = HISTORICAL_STATUSES,
     min_occurrences: int = MIN_OCCURRENCES,
-) -> Mapping[tuple[str, str], RecurrencePattern]:
-    """Every recurring series in one user's history, keyed by category+direction."""
+) -> Mapping[tuple[str, str, str], RecurrencePattern]:
+    """Every recurring series, keyed by category, direction and income stream.
+
+    Income is split by stream, so a base salary and a commission paid in the
+    same category are detected, valued and projected apart. Debits keep one
+    series per category, with an empty stream.
+    """
     history = _historical(events, as_of=as_of, statuses=statuses)
-    keys = sorted({(event.category, event.direction) for event in history})
-    patterns: dict[tuple[str, str], RecurrencePattern] = {}
-    for category, direction in keys:
+    keys = sorted(
+        {(event.category, event.direction, income_stream(event)) for event in history}
+    )
+    patterns: dict[tuple[str, str, str], RecurrencePattern] = {}
+    for category, direction, stream in keys:
         pattern = detect_recurrence(
+            history,
+            category=category,
+            direction=direction,
+            stream=stream or None,
+            as_of=as_of,
+            statuses=statuses,
+            min_occurrences=min_occurrences,
+        )
+        if pattern is not None:
+            patterns[(category, direction, stream)] = pattern
+
+    # A freelancer's income arrives under a different description every month.
+    # Split that finely enough and no stream reaches the evidence threshold,
+    # which would erase income the category plainly repeats. So when no stream
+    # in an income category stands on its own, the category is read as one
+    # series again — at its lowest observed credit, which is the more
+    # conservative of the two readings anyway.
+    for category, direction in sorted(
+        {(category, direction) for category, direction, _ in keys}
+    ):
+        if direction != "credit":
+            continue
+        if any(key[:2] == (category, direction) for key in patterns):
+            continue
+        merged = detect_recurrence(
             history,
             category=category,
             direction=direction,
@@ -330,6 +493,6 @@ def recurrence_patterns(
             statuses=statuses,
             min_occurrences=min_occurrences,
         )
-        if pattern is not None:
-            patterns[(category, direction)] = pattern
+        if merged is not None:
+            patterns[(category, direction, "")] = merged
     return patterns

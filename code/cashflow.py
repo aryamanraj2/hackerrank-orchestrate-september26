@@ -19,9 +19,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
-from recurrence import RecurrencePattern, conservative_amount, recurrence_patterns
+from evidence_policy import IncomeHold, income_holds
+from recurrence import (
+    RecurrencePattern,
+    conservative_amount,
+    income_stream,
+    recurrence_patterns,
+)
 
 #: The forecast period the problem statement reasons over.
 HORIZON_DAYS = 90
@@ -73,6 +79,19 @@ class ForecastBlocker:
 
 
 @dataclass(frozen=True)
+class ForecastNote:
+    """Something the forecast deliberately left out, and why.
+
+    Unlike a :class:`ForecastBlocker` this is a resolved decision, not an
+    unresolved fact: the cash was identified and then withheld on evidence, so
+    the projection stays safe to act on.
+    """
+
+    source_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class Forecast:
     """A chronological projection plus everything a later phase needs."""
 
@@ -84,6 +103,10 @@ class Forecast:
     minimum_balance_to_keep: Decimal
     entries: tuple[LedgerEntry, ...]
     blockers: tuple[ForecastBlocker, ...]
+    #: Cash that was found and then withheld on message evidence. Auditable,
+    #: but never a reason to treat the forecast as incomplete: withholding
+    #: income only ever makes the projection safer.
+    notes: tuple[ForecastNote, ...] = ()
 
     @property
     def is_complete(self) -> bool:
@@ -161,6 +184,8 @@ class Forecast:
         for blocker in self.blockers:
             day = str(blocker.day) if blocker.day else "-"
             lines.append(f"  ! {blocker.source_id:<24} {day:<12} {blocker.reason}")
+        for note in self.notes:
+            lines.append(f"  ~ {note.source_id:<24} {'-':<12} {note.reason}")
         return "\n".join(lines)
 
 
@@ -239,7 +264,8 @@ def _event_entries(
             )
             continue
         signed = -converted if event.direction == "debit" else converted
-        movements.append((day, signed, "event", event.event_id, event.category))
+        group = income_stream(event) or event.category
+        movements.append((day, signed, "event", event.event_id, event.category, group))
     return movements, blockers
 
 
@@ -305,18 +331,30 @@ def _recurrence_entries(
     start: date,
     end: date,
     booked: Sequence[tuple[date, Decimal, str, str, str]],
-) -> tuple[list[tuple[date, Decimal, str, str, str]], list[ForecastBlocker]]:
+    holds: Mapping[str, IncomeHold],
+) -> tuple[
+    list[tuple[date, Decimal, str, str, str]], list[ForecastBlocker], list[ForecastNote]
+]:
     """Project every recurring series history already supports."""
     movements: list[tuple[date, Decimal, str, str, str]] = []
     blockers: list[ForecastBlocker] = []
+    notes: list[ForecastNote] = []
     events_by_id = {event.event_id: event for event in events}
     patterns = recurrence_patterns(events, as_of=start)
 
-    for (category, direction), pattern in sorted(patterns.items()):
-        source_id = f"{category}/{direction}"
+    for (category, direction, stream), pattern in sorted(patterns.items()):
+        source_id = f"{category}/{direction}" + (f"/{stream}" if stream else "")
+        group = stream or category
         if direction == "credit":
             sample = events_by_id.get(pattern.event_ids[-1])
             if sample is None or not _counts_as_income(sample):
+                continue
+            # Message evidence can say plainly that the next payout is not yet
+            # money. Settled history keeps its place in the opening balance;
+            # only the projection ahead is withheld.
+            hold = _hold_for(holds, events, category, stream)
+            if hold is not None:
+                notes.append(ForecastNote(source_id, hold.reason))
                 continue
         extremes = _extreme_by_currency(pattern, events_by_id)
         if not extremes:
@@ -333,7 +371,7 @@ def _recurrence_entries(
         # rows to projected dates.
         window = max(1, pattern.cadence_days // 2)
         explicit = [
-            day for day, _, _, _, entry_category in booked if entry_category == category
+            day for day, _, _, _, _, entry_group in booked if entry_group == group
         ]
         blocked_currencies: set[str] = set()
         for day in pattern.occurrences_between(start + timedelta(days=1), end):
@@ -355,8 +393,71 @@ def _recurrence_entries(
                     )
                 continue
             signed = -amount if direction == "debit" else amount
-            movements.append((day, signed, "recurrence", source_id, category))
-    return movements, blockers
+            movements.append((day, signed, "recurrence", source_id, category, group))
+    notes += _unprojected_income_notes(events, patterns, start=start)
+    return movements, blockers, notes
+
+
+def _stream_names(events, category: str) -> set[str]:
+    return {
+        income_stream(event)
+        for event in events
+        if event.category == category and _counts_as_income(event)
+    }
+
+
+def _hold_for(holds, events, category: str, stream: str):
+    """The hold covering this series, if any.
+
+    A series read as one merged category — the fallback when no single stream
+    had enough history — is withheld as soon as any of the streams inside it
+    is, since there is no way to tell the held money apart from the rest.
+    """
+    if stream:
+        return holds.get(stream)
+    covered = _stream_names(events, category) & set(holds)
+    return holds[sorted(covered)[0]] if covered else None
+
+
+#: A single settled credit is a one-off. Two or more in the same stream look
+#: like a commitment, and declining to project one is worth recording.
+MIN_AMBIGUOUS_OCCURRENCES = 2
+
+
+def _unprojected_income_notes(events, patterns, *, start: date) -> list[ForecastNote]:
+    """Record repeated income that no detected stream covers.
+
+    A stream whose history is too short or too irregular to project is left
+    out of the ledger, which is the safe result. It is not a silent one: an
+    income stream that plainly repeats but could not be pinned to a schedule
+    is exactly the fact a later decision should be able to see.
+    """
+    projected = {
+        (pattern.category, pattern.stream)
+        for pattern in patterns.values()
+        if pattern.direction == "credit"
+    }
+    # A merged category already speaks for every stream inside it.
+    merged = {category for category, stream in projected if stream == ""}
+    counts: dict[tuple[str, str], int] = {}
+    for event in events:
+        if event.status != "settled" or not _counts_as_income(event):
+            continue
+        if event.settlement_date is None or event.settlement_date > start:
+            continue
+        key = (event.category, income_stream(event))
+        if key in projected or event.category in merged:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        ForecastNote(
+            f"{category}/credit/{stream}" if stream else f"{category}/credit",
+            f"{count} settled occurrences support no projectable schedule; "
+            "this income is not counted",
+        )
+        for (category, stream), count in sorted(counts.items())
+        if count >= MIN_AMBIGUOUS_OCCURRENCES
+    ]
 
 
 def build_forecast(
@@ -365,6 +466,7 @@ def build_forecast(
     start_date: date,
     *,
     horizon_days: int = HORIZON_DAYS,
+    request=None,
 ) -> Forecast:
     """Project ``user_id``'s balance from ``start_date`` over the horizon."""
     profile = dataset.profile_by_user.get(user_id)
@@ -378,13 +480,15 @@ def build_forecast(
     movements, blockers = _event_entries(
         dataset, events, home_currency=home, start=start_date, end=end
     )
-    projected, projection_blockers = _recurrence_entries(
+    holds = income_holds(dataset, user_id, as_of=start_date, request=request)
+    projected, projection_blockers, notes = _recurrence_entries(
         dataset,
         events,
         home_currency=home,
         start=start_date,
         end=end,
         booked=movements,
+        holds=holds,
     )
     blockers += projection_blockers
 
@@ -398,7 +502,7 @@ def build_forecast(
 
     entries: list[LedgerEntry] = []
     balance = profile.current_available_balance
-    for day, amount, source_kind, source_id, category in ordered:
+    for day, amount, source_kind, source_id, category, _group in ordered:
         balance += amount
         event = events_by_id.get(source_id) if source_kind == "event" else None
         rationale = (
@@ -427,11 +531,16 @@ def build_forecast(
         minimum_balance_to_keep=profile.minimum_balance_to_keep,
         entries=tuple(entries),
         blockers=tuple(sorted(blockers, key=lambda item: (item.source_id, item.reason))),
+        notes=tuple(sorted(notes, key=lambda item: (item.source_id, item.reason))),
     )
 
 
 def forecast_for_request(dataset, request, *, horizon_days: int = HORIZON_DAYS) -> Forecast:
     """The baseline forecast a request's decision is made against."""
     return build_forecast(
-        dataset, request.user_id, request.request_date, horizon_days=horizon_days
+        dataset,
+        request.user_id,
+        request.request_date,
+        horizon_days=horizon_days,
+        request=request,
     )

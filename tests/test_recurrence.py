@@ -320,9 +320,12 @@ class RealDatasetPatterns(unittest.TestCase):
             self.dataset.events_for(request.user_id), as_of=request.request_date
         )
         self.assertTrue(patterns, "a user with months of history should have patterns")
-        for (category, direction), pattern in patterns.items():
+        for (category, direction, stream), pattern in patterns.items():
             self.assertEqual(pattern.category, category)
             self.assertEqual(pattern.direction, direction)
+            self.assertEqual(pattern.stream, stream)
+            # Only income is split into streams; debits keep one series each.
+            self.assertEqual(stream == "", direction == "debit")
             self.assertGreaterEqual(pattern.occurrences, MIN_OCCURRENCES)
             self.assertLessEqual(pattern.last_date, request.request_date)
             self.assertGreaterEqual(pattern.cadence_days, 1)
@@ -487,6 +490,90 @@ class AlternatingCadence(unittest.TestCase):
         events = series(["2025-10-01", "2025-10-20", "2025-11-02", "2025-12-30"])
         self.assertIsNone(
             detect_recurrence(events, category="streaming", direction="debit")
+        )
+
+
+class DominantSubsequenceTests(unittest.TestCase):
+    """A one-off settled beside a series must not erase the series."""
+
+    PAYROLL = ["2025-03-15", "2025-04-15", "2025-05-15", "2025-06-15", "2025-07-15"]
+
+    def salary(self, days, **overrides):
+        return series(days, category="salary", direction="credit", **overrides)
+
+    def one_off(self, day, amount="900"):
+        """A settled salary credit that belongs to no schedule."""
+        return [
+            make_event(
+                f"one_off_{day}",
+                day,
+                category="salary",
+                direction="credit",
+                amount=amount,
+            )
+        ]
+
+    def test_monthly_payroll_survives_an_interleaved_one_off(self) -> None:
+        events = self.salary(self.PAYROLL) + self.one_off("2025-05-22")
+        pattern = detect_recurrence(events, category="salary", direction="credit")
+        self.assertIsNotNone(pattern)
+        self.assertEqual(pattern.month_day, 15)
+        self.assertEqual(pattern.occurrences, len(self.PAYROLL))
+        self.assertEqual(
+            pattern.dates, tuple(date.fromisoformat(day) for day in self.PAYROLL)
+        )
+
+    def test_the_one_off_leaves_no_trace_in_the_pattern(self) -> None:
+        outlier = self.one_off("2025-05-22")
+        events = self.salary(self.PAYROLL) + outlier
+        pattern = detect_recurrence(events, category="salary", direction="credit")
+        self.assertNotIn(outlier[0].event_id, pattern.event_ids)
+        self.assertNotIn(date(2025, 5, 22), pattern.dates)
+        # A credit is projected at its observed low, so an unrelated larger or
+        # smaller one-off must not move the figure either way.
+        self.assertEqual(pattern.conservative_amount, Decimal("20"))
+
+    def test_two_unrelated_occurrences_are_both_discarded(self) -> None:
+        events = (
+            self.salary(self.PAYROLL)
+            + self.one_off("2025-05-20", amount="500")
+            + self.one_off("2025-05-31", amount="700")
+        )
+        pattern = detect_recurrence(events, category="salary", direction="credit")
+        self.assertEqual(pattern.occurrences, len(self.PAYROLL))
+        self.assertEqual(pattern.month_day, 15)
+
+    def test_projection_continues_the_retained_series(self) -> None:
+        events = self.salary(self.PAYROLL) + self.one_off("2025-05-22")
+        pattern = detect_recurrence(events, category="salary", direction="credit")
+        self.assertEqual(
+            pattern.next_occurrence_after(date(2025, 7, 20)), date(2025, 8, 15)
+        )
+
+    def test_weekly_income_is_kept_whole(self) -> None:
+        weekly = ["2025-06-04", "2025-06-11", "2025-06-18", "2025-06-25", "2025-07-02"]
+        pattern = detect_recurrence(
+            self.salary(weekly), category="salary", direction="credit"
+        )
+        self.assertEqual(pattern.occurrences, len(weekly))
+        self.assertEqual(pattern.cadence_cycle, (7,))
+
+    def test_an_irregular_sequence_is_still_rejected(self) -> None:
+        # Three settled rows, no cadence any subsequence can support.
+        events = self.salary(["2025-03-15", "2025-04-15", "2025-07-15"])
+        self.assertIsNone(
+            detect_recurrence(events, category="salary", direction="credit")
+        )
+
+    def test_a_retained_subsequence_still_needs_three_occurrences(self) -> None:
+        # Two on the 15th is a coincidence, whatever else sits beside them.
+        events = (
+            self.salary(["2025-03-15", "2025-04-15"])
+            + self.one_off("2025-04-21")
+            + self.one_off("2025-05-02")
+        )
+        self.assertIsNone(
+            detect_recurrence(events, category="salary", direction="credit")
         )
 
 

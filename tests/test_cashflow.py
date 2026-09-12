@@ -8,7 +8,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
-from helpers import build_dataset, default_tables
+from helpers import REAL_DATASET, build_dataset, default_tables
 
 from cashflow import HORIZON_DAYS, build_forecast, forecast_for_request
 from dataset_loader import load_dataset
@@ -372,6 +372,7 @@ class CalendarProjectionTests(ForecastTestCase):
             event(
                 event_id=f"event_pay_{index}",
                 event_type="income",
+                description="Monthly salary",
                 category="salary",
                 direction="credit",
                 currency=currency,
@@ -398,12 +399,14 @@ class CalendarProjectionTests(ForecastTestCase):
                 "financial_events": rows + self.salary_series(),
             }
         )
-        entries = self.entries_for(forecast, "salary/credit")
+        entries = self.entries_for(forecast, "salary/credit/Monthly salary")
         self.assertTrue(entries)
         self.assertTrue(all(entry.day.day == 15 for entry in entries))
         self.assertTrue(all(entry.amount == Decimal("20000") for entry in entries))
         # No drift means no artificial missing-rate blocker.
-        self.assertEqual([b for b in forecast.blockers if b.source_id == "salary/credit"], [])
+        self.assertEqual(
+            [b for b in forecast.blockers if b.source_id.startswith("salary/credit")], []
+        )
         self.assertTrue(forecast.is_complete)
 
 
@@ -492,6 +495,375 @@ class RealDatasetTests(unittest.TestCase):
                 all(entry.day <= first.end_date for entry in first.entries)
             )
             self.assertTrue(first.trace())
+
+
+class IncomeHoldTests(ForecastTestCase):
+    """An explicitly unconfirmed payout stops being projected, and says so."""
+
+    #: A weekly gig stream: three settled payouts, cadence supported by history.
+    PAYOUTS = ("2025-12-15", "2025-12-22", "2025-12-29")
+
+    PENDING_NOTICE = (
+        "The next payout is still pending. The weekly earnings shown in the app "
+        "can change until the payout is closed. The balance isn't withdrawable "
+        "until the payout shows as completed."
+    )
+
+    def payout_events(self):
+        return [
+            event(
+                event_id=f"event_p{index}",
+                event_type="income",
+                description="Platform payout",
+                category="gig",
+                direction="credit",
+                amount="300",
+                event_date=day,
+                settlement_date=day,
+            )
+            for index, day in enumerate(self.PAYOUTS, start=1)
+        ]
+
+    def notice(self, text):
+        return [
+            {
+                "message_id": "message_hold",
+                "user_id": "user_a",
+                "request_id": "request_a",
+                "related_event_id": "",
+                "sent_at": "2026-01-04T09:30:00Z",
+                "source_type": "service_provider",
+                "message_text": text,
+            }
+        ]
+
+    def forecast_with(self, messages):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dataset(
+                Path(tmp),
+                tables={
+                    "financial_events": list(default_tables()["financial_events"])
+                    + self.payout_events(),
+                    "messages": messages,
+                },
+            )
+            dataset = load_dataset(Path(tmp) / "dataset")
+            return forecast_for_request(dataset, dataset.request_by_id["request_a"])
+
+    def gig_entries(self, forecast):
+        return [entry for entry in forecast.entries if entry.category == "gig"]
+
+    def test_the_same_history_is_forecast_without_a_notice(self) -> None:
+        forecast = self.forecast_with([])
+        self.assertTrue(self.gig_entries(forecast))
+        self.assertTrue(all(entry.amount > 0 for entry in self.gig_entries(forecast)))
+        self.assertEqual(forecast.notes, ())
+
+    def test_an_unconfirmed_payout_withholds_future_credits(self) -> None:
+        forecast = self.forecast_with(self.notice(self.PENDING_NOTICE))
+        self.assertEqual(self.gig_entries(forecast), [])
+
+    def test_the_hold_is_explained_in_the_trace(self) -> None:
+        forecast = self.forecast_with(self.notice(self.PENDING_NOTICE))
+        self.assertEqual(len(forecast.notes), 1)
+        note = forecast.notes[0]
+        self.assertEqual(note.source_id, "gig/credit/Platform payout")
+        self.assertIn("message_hold", note.reason)
+        self.assertIn("message_hold", forecast.trace())
+
+    def test_a_hold_never_makes_the_forecast_incomplete(self) -> None:
+        # Withheld income is a resolved decision, not missing evidence: the
+        # projection is safe to act on, merely poorer.
+        forecast = self.forecast_with(self.notice(self.PENDING_NOTICE))
+        self.assertTrue(forecast.is_complete)
+        self.assertEqual(forecast.blockers, ())
+
+    def test_settled_history_is_never_unspent(self) -> None:
+        held = self.forecast_with(self.notice(self.PENDING_NOTICE))
+        free = self.forecast_with([])
+        self.assertEqual(held.opening_balance, free.opening_balance)
+        # Holding the stream can only lower the projection, never raise it.
+        self.assertLess(held.closing_balance, free.closing_balance)
+
+    def test_a_confirmation_of_the_same_stream_leaves_it_forecast(self) -> None:
+        forecast = self.forecast_with(
+            self.notice("The payout has been released and is now withdrawable.")
+        )
+        self.assertTrue(self.gig_entries(forecast))
+        self.assertEqual(forecast.notes, ())
+
+    def test_a_base_salary_confirmation_does_not_release_a_payout_hold(self) -> None:
+        # Two clauses, two streams: the fixed one is confirmed, the variable
+        # one is not. Confirming the first says nothing about the second.
+        forecast = self.forecast_with(
+            self.notice(
+                "Your confirmed monthly salary is unchanged. " + self.PENDING_NOTICE
+            )
+        )
+        self.assertEqual(self.gig_entries(forecast), [])
+
+    def test_expenses_are_untouched_by_an_income_hold(self) -> None:
+        held = self.forecast_with(self.notice(self.PENDING_NOTICE))
+        free = self.forecast_with([])
+        debits = lambda forecast: [
+            (entry.day, entry.amount) for entry in forecast.entries if entry.is_debit
+        ]
+        self.assertEqual(debits(held), debits(free))
+
+
+class IncomeStreamTests(ForecastTestCase):
+    """Two pay sources in one category are two commitments, not one."""
+
+    BASE = ("2025-10-15", "2025-11-15", "2025-12-15")
+    COMMISSION = ("2025-10-24", "2025-11-24", "2025-12-24")
+
+    def income(self, event_id, day, description, amount):
+        return event(
+            event_id=event_id,
+            event_type="income",
+            description=description,
+            category="salary",
+            direction="credit",
+            amount=amount,
+            event_date=day,
+            settlement_date=day,
+        )
+
+    def two_streams(self):
+        rows = [
+            self.income(f"event_base_{index}", day, "Base salary", "2000")
+            for index, day in enumerate(self.BASE, start=1)
+        ]
+        # A commission varies; its conservative figure is its observed low.
+        for index, (day, amount) in enumerate(
+            zip(self.COMMISSION, ("900", "400", "700")), start=1
+        ):
+            rows.append(
+                self.income(f"event_comm_{index}", day, "Sales commission", amount)
+            )
+        return rows
+
+    def forecast_streams(self, messages=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dataset(
+                Path(tmp),
+                tables={
+                    "financial_events": [
+                        row
+                        for row in default_tables()["financial_events"]
+                        if row["category"] != "salary"
+                    ]
+                    + self.two_streams(),
+                    "messages": messages if messages is not None else [],
+                },
+            )
+            dataset = load_dataset(Path(tmp) / "dataset")
+            return forecast_for_request(dataset, dataset.request_by_id["request_a"])
+
+    def notice(self, text):
+        return [
+            {
+                "message_id": "message_split",
+                "user_id": "user_a",
+                "request_id": "request_a",
+                "related_event_id": "",
+                "sent_at": "2026-01-04T09:30:00Z",
+                "source_type": "employer",
+                "message_text": text,
+            }
+        ]
+
+    def test_interleaved_streams_become_two_patterns(self) -> None:
+        forecast = self.forecast_streams()
+        base = self.entries_for(forecast, "salary/credit/Base salary")
+        commission = self.entries_for(forecast, "salary/credit/Sales commission")
+        self.assertTrue(base)
+        self.assertTrue(commission)
+        self.assertTrue(all(entry.day.day == 15 for entry in base))
+        self.assertTrue(all(entry.day.day == 24 for entry in commission))
+
+    def test_each_stream_is_valued_on_its_own_history(self) -> None:
+        forecast = self.forecast_streams()
+        base = self.entries_for(forecast, "salary/credit/Base salary")
+        commission = self.entries_for(forecast, "salary/credit/Sales commission")
+        self.assertTrue(all(entry.amount == Decimal("2000") for entry in base))
+        # The lowest observed credit, not the average and not the base.
+        self.assertTrue(all(entry.amount == Decimal("400") for entry in commission))
+
+    def test_a_hold_on_the_commission_leaves_the_base_forecast(self) -> None:
+        forecast = self.forecast_streams(
+            self.notice(
+                "Your confirmed base salary is unchanged. The commission payout is "
+                "still pending and is not yet withdrawable."
+            )
+        )
+        self.assertTrue(self.entries_for(forecast, "salary/credit/Base salary"))
+        self.assertEqual(
+            self.entries_for(forecast, "salary/credit/Sales commission"), []
+        )
+        [note] = forecast.notes
+        self.assertEqual(note.source_id, "salary/credit/Sales commission")
+
+    def test_an_unprojectable_repeated_stream_is_recorded_not_counted(self) -> None:
+        # Two occurrences, three months apart: real money, no schedule anyone
+        # can stand behind. It stays out of the ledger and is written down.
+        extra = [
+            self.income("event_odd_1", "2025-09-02", "Ad-hoc retainer", "500"),
+            self.income("event_odd_2", "2025-12-19", "Ad-hoc retainer", "500"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dataset(
+                Path(tmp),
+                tables={
+                    "financial_events": [
+                        row
+                        for row in default_tables()["financial_events"]
+                        if row["category"] != "salary"
+                    ]
+                    + self.two_streams()
+                    + extra
+                },
+            )
+            dataset = load_dataset(Path(tmp) / "dataset")
+            forecast = forecast_for_request(
+                dataset, dataset.request_by_id["request_a"]
+            )
+        self.assertEqual(
+            self.entries_for(forecast, "salary/credit/Ad-hoc retainer"), []
+        )
+        [note] = forecast.notes
+        self.assertEqual(note.source_id, "salary/credit/Ad-hoc retainer")
+        self.assertIn("no projectable schedule", note.reason)
+
+    def test_a_single_one_off_credit_is_not_worth_a_note(self) -> None:
+        extra = [self.income("event_odd_1", "2025-09-02", "Gift received", "500")]
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dataset(
+                Path(tmp),
+                tables={
+                    "financial_events": [
+                        row
+                        for row in default_tables()["financial_events"]
+                        if row["category"] != "salary"
+                    ]
+                    + self.two_streams()
+                    + extra
+                },
+            )
+            dataset = load_dataset(Path(tmp) / "dataset")
+            forecast = forecast_for_request(
+                dataset, dataset.request_by_id["request_a"]
+            )
+        self.assertEqual(forecast.notes, ())
+
+
+class MergedIncomeFallbackTests(ForecastTestCase):
+    """Fine-grained descriptions must not erase income the category repeats."""
+
+    DAYS = ("2025-10-15", "2025-11-15", "2025-12-15")
+
+    def varied_income(self):
+        # Freelance work arrives under a new description every month, so no
+        # single stream reaches the evidence threshold.
+        return [
+            event(
+                event_id=f"event_gig_{index}",
+                event_type="income",
+                description=f"Project {index} payment",
+                category="salary",
+                direction="credit",
+                amount=amount,
+                event_date=day,
+                settlement_date=day,
+            )
+            for index, (day, amount) in enumerate(
+                zip(self.DAYS, ("1500", "900", "1200")), start=1
+            )
+        ]
+
+    def forecast_varied(self, messages=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dataset(
+                Path(tmp),
+                tables={
+                    "financial_events": [
+                        row
+                        for row in default_tables()["financial_events"]
+                        if row["category"] != "salary"
+                    ]
+                    + self.varied_income(),
+                    "messages": messages if messages is not None else [],
+                },
+            )
+            dataset = load_dataset(Path(tmp) / "dataset")
+            return forecast_for_request(dataset, dataset.request_by_id["request_a"])
+
+    def test_a_category_with_no_single_stream_is_read_as_one_series(self) -> None:
+        forecast = self.forecast_varied()
+        entries = self.entries_for(forecast, "salary/credit")
+        self.assertTrue(entries)
+        # Valued at the lowest observed credit across the whole category, which
+        # is never more optimistic than reading the streams apart.
+        self.assertTrue(all(entry.amount == Decimal("900") for entry in entries))
+
+    def test_the_merged_series_leaves_no_ambiguity_notes(self) -> None:
+        self.assertEqual(self.forecast_varied().notes, ())
+
+    def test_a_hold_on_any_stream_withholds_the_merged_series(self) -> None:
+        forecast = self.forecast_varied(
+            [
+                {
+                    "message_id": "message_merge",
+                    "user_id": "user_a",
+                    "request_id": "request_a",
+                    "related_event_id": "event_gig_2",
+                    "sent_at": "2026-01-04T09:30:00Z",
+                    "source_type": "service_provider",
+                    "message_text": (
+                        "The payout is still pending and is not yet withdrawable."
+                    ),
+                }
+            ]
+        )
+        self.assertEqual(self.entries_for(forecast, "salary/credit"), [])
+        self.assertTrue(forecast.notes)
+
+
+class RealDatasetIncomeStreams(unittest.TestCase):
+    """A read-only look at how the supplied data splits into streams."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not REAL_DATASET.is_dir():
+            raise unittest.SkipTest("no dataset/ in this checkout")
+        cls.dataset = load_dataset(REAL_DATASET)
+
+    def test_a_user_with_two_pay_sources_projects_them_separately(self) -> None:
+        # request_11's user is paid a fixed monthly base and a variable
+        # commission, both filed under salary. Whatever the right decision for
+        # that request turns out to be, the two must not be averaged into one
+        # stream, and each must be identifiable in the trace.
+        sample = self.dataset.sample_request_by_id.get("request_11")
+        if sample is None:
+            self.skipTest("request_11 is not in this dataset")
+        forecast = forecast_for_request(self.dataset, sample.request)
+        credit_sources = {
+            entry.source_id for entry in forecast.entries if entry.amount > 0
+        }
+        withheld = {note.source_id for note in forecast.notes}
+        identified = credit_sources | withheld
+        self.assertGreater(len(identified), 1, forecast.trace())
+        for source_id in identified:
+            self.assertTrue(source_id.startswith("salary/credit/"), source_id)
+        # Every projected occurrence of one stream carries that stream's own
+        # amount rather than a figure blended across both.
+        for source_id in credit_sources:
+            amounts = {
+                entry.amount
+                for entry in forecast.entries
+                if entry.source_id == source_id
+            }
+            self.assertEqual(len(amounts), 1, source_id)
 
 
 if __name__ == "__main__":
