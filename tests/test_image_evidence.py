@@ -119,7 +119,8 @@ class AppliedTests(ImageEvidenceTestCase):
         self.assertEqual(self.blockers_for(resolved, "gym/debit"), [])
         booked = [e.amount for e in resolved.entries if e.source_id == "gym/debit"]
         self.assertTrue(booked)
-        self.assertTrue(all(amount == Decimal("-12") for amount in booked))
+        # The resolved 12 joins 10 and 10; the series projects their mean.
+        self.assertTrue(all(amount == Decimal("-10.67") for amount in booked))
 
 
 class RejectionTests(ImageEvidenceTestCase):

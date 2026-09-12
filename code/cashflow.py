@@ -6,9 +6,9 @@ decided? It books only cash that the dataset actually supports — settled money
 that has not moved yet, reserved pending debits, scheduled commitments, and
 recurring series that :mod:`recurrence` has already validated against history.
 
-Every booking is conservative by construction: expenses are taken at the high
-end of what history shows, income only when it is confirmed or repeatedly
-evidenced, and anything unresolved (a blank amount, a missing exchange rate) is
+Every booking is evidence-bound: a recurring series is projected at the
+amount :func:`recurrence.series_amount` derives from its history, income only
+when it is confirmed or repeatedly evidenced, and anything unresolved (a blank amount, a missing exchange rate) is
 surfaced as a blocker instead of being guessed at or silently treated as zero.
 
 No recommendation, payment option or spending change is chosen here.
@@ -29,6 +29,7 @@ from recurrence import (
     conservative_amount,
     income_stream,
     recurrence_patterns,
+    series_amount,
 )
 
 #: The forecast period the problem statement reasons over.
@@ -289,42 +290,40 @@ def _rationale_for_event(event, day: date) -> str:
     return f"{event.status} {event.direction} settling {day}"
 
 
-def _extreme_by_currency(
+def _amount_by_currency(
     pattern: RecurrencePattern, events_by_id
 ) -> dict[str, Decimal] | None:
-    """The conservative observed amount per currency, still unconverted.
+    """The series' projected amount per currency, still unconverted.
 
     ``None`` when the series contains an occurrence whose amount is still
-    blank: its conservative figure cannot be established until that evidence
-    is resolved, and guessing one would understate the commitment.
-    Conversion is monotone in the rate, so keeping one extreme per currency
-    loses nothing and leaves only a handful of values to convert per date.
+    blank: its figure cannot be established until that evidence is resolved,
+    and guessing one could understate the commitment. The estimate is taken
+    per currency before conversion, so each date converts one value per
+    currency.
     """
-    extremes: dict[str, Decimal] = {}
+    amounts: dict[str, list[Decimal]] = {}
     for event_id in pattern.event_ids:
         event = events_by_id.get(event_id)
         if event is None:
             continue
         if event.amount is None:
             return None
-        current = extremes.get(event.currency)
-        extremes[event.currency] = (
-            event.amount
-            if current is None
-            else conservative_amount(pattern.direction, (current, event.amount))
-        )
-    return extremes
+        amounts.setdefault(event.currency, []).append(event.amount)
+    return {
+        currency: series_amount(pattern.direction, values)
+        for currency, values in amounts.items()
+    }
 
 
 def _projected_amount(
     dataset, pattern: RecurrencePattern, extremes, home_currency: str, day: date
 ) -> tuple[Decimal | None, str | None]:
-    """The conservative home-currency amount for one projected date.
+    """The home-currency amount for one projected date.
 
     Every occurrence is valued at the rate supplied for the date it is
     projected on, never at a rate carried over from history. A mixed-currency
-    history is compared after each currency has been converted for that same
-    date. Returns ``(None, currency)`` when a needed rate is not supplied.
+    history takes the safer of its per-currency figures once each has been
+    converted for that same date. Returns ``(None, currency)`` when a needed rate is not supplied.
     """
     converted: list[Decimal] = []
     for currency, amount in sorted(extremes.items()):
@@ -370,7 +369,7 @@ def _recurrence_entries(
             if hold is not None:
                 notes.append(ForecastNote(source_id, hold.reason))
                 continue
-        extremes = _extreme_by_currency(pattern, events_by_id)
+        extremes = _amount_by_currency(pattern, events_by_id)
         if not extremes:
             blockers.append(
                 ForecastBlocker(

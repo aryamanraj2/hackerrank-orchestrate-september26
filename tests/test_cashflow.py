@@ -12,7 +12,7 @@ from helpers import REAL_DATASET, build_dataset, default_tables
 
 from cashflow import HORIZON_DAYS, build_forecast, forecast_for_request
 from dataset_loader import load_dataset
-from recurrence import conservative_amount
+from recurrence import conservative_amount, series_amount
 
 REQUEST_DATE = date(2026, 1, 5)
 
@@ -236,12 +236,12 @@ class RecurrenceProjectionTests(ForecastTestCase):
         self.assertTrue(all(entry.day > REQUEST_DATE for entry in streaming))
         self.assertTrue(all(entry.day <= forecast.end_date for entry in streaming))
 
-    def test_variable_expense_projects_the_highest_observed_amount(self):
+    def test_variable_expense_projects_the_mean_observed_amount(self):
         forecast = self.forecast()
         dining = self.entries_for(forecast, "dining/debit")
         self.assertTrue(dining)
         # Observed dining amounts are 110, 105, 100 and 95.
-        self.assertTrue(all(entry.amount == Decimal("-110") for entry in dining))
+        self.assertTrue(all(entry.amount == Decimal("-102.50") for entry in dining))
 
     def test_one_off_spending_is_not_projected(self):
         forecast = self.forecast()
@@ -261,6 +261,21 @@ class RecurrenceProjectionTests(ForecastTestCase):
         ]
         self.assertEqual(len(january), 1)
         self.assertEqual(january[0].source_id, "event_stream_next")
+
+    def test_series_amount_policy(self):
+        amounts = (Decimal("10"), Decimal("30"), Decimal("20.01"), Decimal("20"))
+        # Debits: mean 80.01 / 4 = 20.0025, half-up to the cent.
+        self.assertEqual(series_amount("debit", amounts), Decimal("20.00"))
+        self.assertEqual(series_amount("debit", amounts[:3]), Decimal("20.00"))
+        self.assertEqual(series_amount("debit", (Decimal("0.01"), Decimal("0.02"))), Decimal("0.02"))
+        # Credits: median, even count averages the middle two (20 and 20.01).
+        self.assertEqual(series_amount("credit", amounts), Decimal("20.01"))
+        self.assertIsNone(series_amount("debit", ()))
+
+    def test_identical_amount_series_is_unchanged(self):
+        same = (Decimal("5148.125"),) * 4
+        self.assertEqual(series_amount("debit", same), Decimal("5148.125"))
+        self.assertEqual(series_amount("credit", same), Decimal("5148.125"))
 
     def test_conservative_amount_picks_against_the_user(self):
         amounts = (Decimal("10"), Decimal("30"), Decimal("20"))
@@ -331,9 +346,19 @@ class ProjectedCurrencyTests(ForecastTestCase):
         booked = {
             entry.day: entry.amount for entry in self.entries_for(forecast, "gym/debit")
         }
-        # At 20 the 250 ZAR occurrence is the larger debit; at 25 the 12 EUR one is.
+        # EUR is estimated before conversion (mean of 10 and 12 = 11 EUR): at 20
+        # the 250 ZAR figure is the larger debit; at 25 the 11 EUR one is.
         self.assertEqual(booked[self.PROJECTED[0]], Decimal("-250"))
-        self.assertEqual(booked[self.PROJECTED[1]], Decimal("-300"))
+        self.assertEqual(booked[self.PROJECTED[1]], Decimal("-275"))
+
+    def test_foreign_series_is_estimated_before_conversion(self):
+        rates = [self.rate(day, "20") for day in self.PROJECTED]
+        forecast = self.forecast(
+            *self.gym_series(["10", "10", "11"]), tables={"exchange_rates": rates}
+        )
+        # mean(10, 10, 11) = 10.33 EUR, then x20. Converting first would give 206.67.
+        amounts = {entry.amount for entry in self.entries_for(forecast, "gym/debit")}
+        self.assertEqual(amounts, {Decimal("-206.60")})
 
     def test_missing_projected_rate_blocks_that_series(self):
         rates = [self.rate(self.PROJECTED[0], "20")]
@@ -634,7 +659,7 @@ class IncomeStreamTests(ForecastTestCase):
             self.income(f"event_base_{index}", day, "Base salary", "2000")
             for index, day in enumerate(self.BASE, start=1)
         ]
-        # A commission varies; its conservative figure is its observed low.
+        # A commission varies; it is projected at its observed median.
         for index, (day, amount) in enumerate(
             zip(self.COMMISSION, ("900", "400", "700")), start=1
         ):
@@ -687,8 +712,8 @@ class IncomeStreamTests(ForecastTestCase):
         base = self.entries_for(forecast, "salary/credit/Base salary")
         commission = self.entries_for(forecast, "salary/credit/Sales commission")
         self.assertTrue(all(entry.amount == Decimal("2000") for entry in base))
-        # The lowest observed credit, not the average and not the base.
-        self.assertTrue(all(entry.amount == Decimal("400") for entry in commission))
+        # The stream's own median (900, 400, 700), not the base.
+        self.assertTrue(all(entry.amount == Decimal("700") for entry in commission))
 
     def test_a_hold_on_the_commission_leaves_the_base_forecast(self) -> None:
         forecast = self.forecast_streams(
@@ -802,9 +827,8 @@ class MergedIncomeFallbackTests(ForecastTestCase):
         forecast = self.forecast_varied()
         entries = self.entries_for(forecast, "salary/credit")
         self.assertTrue(entries)
-        # Valued at the lowest observed credit across the whole category, which
-        # is never more optimistic than reading the streams apart.
-        self.assertTrue(all(entry.amount == Decimal("900") for entry in entries))
+        # Valued at the median credit across the whole category (1500, 900, 1200).
+        self.assertTrue(all(entry.amount == Decimal("1200") for entry in entries))
 
     def test_the_merged_series_leaves_no_ambiguity_notes(self) -> None:
         self.assertEqual(self.forecast_varied().notes, ())

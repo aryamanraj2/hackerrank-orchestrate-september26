@@ -17,7 +17,7 @@ import calendar
 import statistics
 from dataclasses import dataclass
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Iterable, Mapping, Sequence
 
 #: Only settled records are evidence of a commitment that actually repeats.
@@ -43,15 +43,34 @@ CADENCE_TOLERANCE_RATIO = Decimal("0.25")
 
 
 def conservative_amount(direction: str, amounts: Sequence[Decimal]) -> Decimal | None:
-    """The safe figure to project: the largest debit, the smallest credit.
+    """The safer of several figures: the largest debit, the smallest credit.
 
-    A variable series must never flatter a forecast, so spending is taken at
-    its observed high and income at its observed low. Callers that convert
-    currencies first pass the converted amounts.
+    Used where one value must be picked from alternatives that are not a
+    history, such as one series' amounts converted from different currencies.
     """
     if not amounts:
         return None
     return max(amounts) if direction == "debit" else min(amounts)
+
+
+def series_amount(direction: str, amounts: Sequence[Decimal]) -> Decimal | None:
+    """The figure to project for one series, from its observed amounts.
+
+    Projection policy: a debit is projected at the mean of its settled
+    amounts and a credit at their median, each rounded half-up to the cent.
+    A series whose amounts never vary projects that amount unchanged. Apply
+    per currency, before any conversion.
+    """
+    if not amounts:
+        return None
+    if len(set(amounts)) == 1:
+        return amounts[0]
+    value = (
+        sum(amounts) / len(amounts)
+        if direction == "debit"
+        else Decimal(statistics.median(amounts))
+    )
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 @dataclass(frozen=True)
@@ -107,8 +126,8 @@ class RecurrencePattern:
 
     @property
     def conservative_amount(self) -> Decimal | None:
-        """The safe figure to project, in the observed currency."""
-        return conservative_amount(self.direction, self.amounts)
+        """The figure to project (see :func:`series_amount`), in the observed currency."""
+        return series_amount(self.direction, self.amounts)
 
     def _projected_dates(self, until: date):
         """Yield occurrences after ``last_date`` up to ``until``, in phase."""
@@ -476,8 +495,7 @@ def recurrence_patterns(
     # Split that finely enough and no stream reaches the evidence threshold,
     # which would erase income the category plainly repeats. So when no stream
     # in an income category stands on its own, the category is read as one
-    # series again — at its lowest observed credit, which is the more
-    # conservative of the two readings anyway.
+    # series again, projected like any other credit series.
     for category, direction in sorted(
         {(category, direction) for category, direction, _ in keys}
     ):
