@@ -13,6 +13,7 @@ against.
 
 from __future__ import annotations
 
+import calendar
 import statistics
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -37,6 +38,18 @@ CADENCE_TOLERANCE_DAYS = 4
 CADENCE_TOLERANCE_RATIO = Decimal("0.25")
 
 
+def conservative_amount(direction: str, amounts: Sequence[Decimal]) -> Decimal | None:
+    """The safe figure to project: the largest debit, the smallest credit.
+
+    A variable series must never flatter a forecast, so spending is taken at
+    its observed high and income at its observed low. Callers that convert
+    currencies first pass the converted amounts.
+    """
+    if not amounts:
+        return None
+    return max(amounts) if direction == "debit" else min(amounts)
+
+
 @dataclass(frozen=True)
 class RecurrencePattern:
     """A repeating series of same-category events in one user's history."""
@@ -47,8 +60,19 @@ class RecurrencePattern:
     event_ids: tuple[str, ...]
     #: Settlement dates of the observed occurrences, ascending.
     dates: tuple[date, ...]
+    #: Representative interval, for description and coarse comparisons.
     cadence_days: int
+    #: The exact repeating gap cycle, rotated so ``cadence_cycle[0]`` is the
+    #: gap that follows ``last_date``. A day-based monthly series is ``(30,)``;
+    #: a semi-monthly one keeps both of its intervals. Ignored when
+    #: ``month_day`` is set.
+    cadence_cycle: tuple[int, ...]
     amounts: tuple[Decimal, ...]
+    #: Day-of-month anchor when history settles on a calendar schedule (the
+    #: 15th of consecutive months). ``31`` means "the last day of the month".
+    #: Calendar projection keeps the real settlement day instead of drifting
+    #: by a fixed number of days each month.
+    month_day: int | None = None
 
     @property
     def occurrences(self) -> int:
@@ -73,27 +97,109 @@ class RecurrencePattern:
             return None
         return Decimal(statistics.median(sorted(self.amounts)))
 
+    @property
+    def conservative_amount(self) -> Decimal | None:
+        """The safe figure to project, in the observed currency."""
+        return conservative_amount(self.direction, self.amounts)
+
+    def _projected_dates(self, until: date):
+        """Yield occurrences after ``last_date`` up to ``until``, in phase."""
+        if self.month_day is not None:
+            current = self.last_date
+            months = 0
+            while current <= until:
+                months += 1
+                current = _anchored(self.last_date, months, self.month_day)
+                yield current
+            return
+        current = self.last_date
+        index = 0
+        while current <= until:
+            current += timedelta(days=self.cadence_cycle[index % len(self.cadence_cycle)])
+            index += 1
+            yield current
+
     def next_occurrence_after(self, day: date) -> date:
         """The first projected occurrence strictly after ``day``."""
-        projected = self.last_date
-        while projected <= day:
-            projected += timedelta(days=self.cadence_days)
-        return projected
+        for projected in self._projected_dates(day):
+            if projected > day:
+                return projected
+        raise AssertionError("unreachable: the cycle always advances")
 
     def occurrences_between(self, start: date, end: date) -> tuple[date, ...]:
-        """Projected occurrence dates in ``[start, end]``, cadence-spaced.
+        """Projected occurrence dates in ``[start, end]``.
 
-        Forward projection continues the observed series; it never invents a
-        different rhythm or amount.
+        Forward projection continues the observed series in its own phase: a
+        series paid on the 1st and the 23rd keeps alternating, rather than
+        being flattened into one fabricated interval.
         """
         if end < start:
             return ()
-        projected: list[date] = []
-        current = self.next_occurrence_after(start - timedelta(days=1))
-        while current <= end:
-            projected.append(current)
-            current += timedelta(days=self.cadence_days)
-        return tuple(projected)
+        return tuple(
+            day for day in self._projected_dates(end) if day <= end and day >= start
+        )
+
+
+#: A calendar-month gap, allowing for February and for a settlement nudged by
+#: a weekend.
+MIN_MONTH_GAP_DAYS = 26
+MAX_MONTH_GAP_DAYS = 32
+
+
+def _anchored(origin: date, months: int, month_day: int) -> date:
+    """``origin`` advanced by ``months``, settled on its day-of-month anchor.
+
+    The anchor is measured from the original month every time, so a series
+    anchored to the 31st returns to the 31st after a short month instead of
+    walking backwards. A month too short for the anchor settles on its last
+    day, which is the conservative reading of "end of month".
+    """
+    month_index = origin.year * 12 + (origin.month - 1) + months
+    year, month = divmod(month_index, 12)
+    last_day = calendar.monthrange(year, month + 1)[1]
+    return date(year, month + 1, min(month_day, last_day))
+
+
+def _month_anchor(dates: Sequence[date], gaps: Sequence[int]) -> int | None:
+    """The day-of-month a series settles on, or ``None`` if it is not monthly.
+
+    Evidence only: every gap must be one calendar month long, and every
+    observation must fall on the anchor day clamped to its own month, so a
+    series anchored to the 30th may settle on 28 February and nowhere else.
+    A month-end series is the same rule with an anchor of 31. An irregular
+    series never becomes a monthly one here.
+    """
+    if not gaps or any(
+        not MIN_MONTH_GAP_DAYS <= gap <= MAX_MONTH_GAP_DAYS for gap in gaps
+    ):
+        return None
+    anchor = max(day.day for day in dates)
+    for day in dates:
+        last_day = calendar.monthrange(day.year, day.month)[1]
+        if day.day != min(anchor, last_day):
+            return None
+    return anchor
+
+
+def _alternating_cycle(gaps: Sequence[int]) -> tuple[int, int] | None:
+    """The exact two-gap cycle of a semi-monthly series, or ``None``.
+
+    Pay on the 1st and the 23rd gives gaps that alternate (22, 9, 22, 9, ...).
+    No single median describes that, but each phase is consistent on its own,
+    so both intervals are kept and projected in turn.
+    """
+    phases = (gaps[0::2], gaps[1::2])
+    if len(gaps) < 3 or not all(phases):
+        return None
+    medians = []
+    for phase in phases:
+        median = statistics.median(phase)
+        if median < MIN_CADENCE_DAYS or not _cadence_is_consistent(phase, median):
+            return None
+        medians.append(int(round(median)))
+    if sum(medians) > MAX_CADENCE_DAYS:
+        return None
+    return medians[0], medians[1]
 
 
 def _cadence_is_consistent(gaps: Sequence[int], median: float) -> bool:
@@ -156,10 +262,21 @@ def detect_recurrence(
         return None
 
     median = statistics.median(gaps)
-    if not MIN_CADENCE_DAYS <= median <= MAX_CADENCE_DAYS:
-        return None
-    if not _cadence_is_consistent(gaps, median):
-        return None
+    month_day = _month_anchor(dates, gaps)
+    cycle: tuple[int, ...]
+    if month_day is not None or (
+        MIN_CADENCE_DAYS <= median <= MAX_CADENCE_DAYS and _cadence_is_consistent(gaps, median)
+    ):
+        cycle = (int(round(median)),)
+    else:
+        alternating = _alternating_cycle(gaps)
+        if alternating is None:
+            return None
+        cycle = alternating
+    # Rotate so the first entry is the gap that follows the last observation:
+    # the series resumes in the phase it actually left off in.
+    offset = len(gaps) % len(cycle)
+    cycle = cycle[offset:] + cycle[:offset]
 
     return RecurrencePattern(
         user_id=series[0].user_id,
@@ -167,7 +284,9 @@ def detect_recurrence(
         direction=direction,
         event_ids=tuple(event.event_id for event in series),
         dates=tuple(dates),
-        cadence_days=int(round(median)),
+        cadence_days=int(round(sum(cycle) / len(cycle))),
+        cadence_cycle=cycle,
+        month_day=month_day,
         amounts=tuple(event.amount for event in series if event.amount is not None),
     )
 

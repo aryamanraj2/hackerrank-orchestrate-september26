@@ -1,0 +1,437 @@
+"""Deterministic cash-flow forecasting for one user over a fixed horizon.
+
+The forecast answers a single question: what does this user's balance do,
+day by day, from the request date through the next 90 days, if nothing new is
+decided? It books only cash that the dataset actually supports — settled money
+that has not moved yet, reserved pending debits, scheduled commitments, and
+recurring series that :mod:`recurrence` has already validated against history.
+
+Every booking is conservative by construction: expenses are taken at the high
+end of what history shows, income only when it is confirmed or repeatedly
+evidenced, and anything unresolved (a blank amount, a missing exchange rate) is
+surfaced as a blocker instead of being guessed at or silently treated as zero.
+
+No recommendation, payment option or spending change is chosen here.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, timedelta
+from decimal import Decimal
+from typing import Iterable, Sequence
+
+from recurrence import RecurrencePattern, conservative_amount, recurrence_patterns
+
+#: The forecast period the problem statement reasons over.
+HORIZON_DAYS = 90
+
+#: Statuses whose cash never moves, in either direction.
+EXCLUDED_STATUSES = frozenset({"failed", "cancelled", "unrealized"})
+
+#: Statuses that can still move cash on or after the request date.
+CASH_STATUSES = frozenset({"settled", "pending", "scheduled"})
+
+#: Only confirmed earned income counts. Refunds, investment sales and other
+#: credit event types are not money the user can plan on.
+COUNTED_CREDIT_EVENT_TYPES = frozenset({"income"})
+
+#: Windfalls (bonuses, commissions, lottery proceeds) never count, even when
+#: they are recorded as income.
+UNCOUNTED_CREDIT_CATEGORIES = frozenset({"windfall"})
+
+
+@dataclass(frozen=True)
+class LedgerEntry:
+    """One projected cash movement, in the user's home currency."""
+
+    day: date
+    #: Signed home-currency amount: negative for money out, positive for money in.
+    amount: Decimal
+    #: ``"event"`` for a supplied row, ``"recurrence"`` for a projected series.
+    source_kind: str
+    #: ``event_id`` or ``"<category>/<direction>"`` for a projected series.
+    source_id: str
+    category: str
+    #: Why this cash state was booked on this date.
+    rationale: str
+    #: Projected balance once this entry has been applied.
+    balance_after: Decimal
+
+    @property
+    def is_debit(self) -> bool:
+        return self.amount < 0
+
+
+@dataclass(frozen=True)
+class ForecastBlocker:
+    """A fact the forecast could not resolve from the data supplied."""
+
+    source_id: str
+    day: date | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class Forecast:
+    """A chronological projection plus everything a later phase needs."""
+
+    user_id: str
+    home_currency: str
+    start_date: date
+    end_date: date
+    opening_balance: Decimal
+    minimum_balance_to_keep: Decimal
+    entries: tuple[LedgerEntry, ...]
+    blockers: tuple[ForecastBlocker, ...]
+
+    @property
+    def is_complete(self) -> bool:
+        """False while any cash the horizon needs is still unresolved.
+
+        An incomplete forecast is missing money it knows about: a recurring
+        debit whose amount or exchange rate could not be established is simply
+        absent from the ledger, so ``closing_balance``, ``minimum_balance``
+        and ``balance_on`` are all upper bounds rather than projections. They
+        must never be used to establish that a payment is affordable — resolve
+        the blockers first, or treat the request as undecidable.
+        """
+        return not self.blockers
+
+    @property
+    def closing_balance(self) -> Decimal:
+        return self.entries[-1].balance_after if self.entries else self.opening_balance
+
+    @property
+    def minimum_balance(self) -> Decimal:
+        """Lowest balance reached anywhere in the horizon.
+
+        Only an upper bound when :attr:`is_complete` is false.
+        """
+        return self.minimum_balance_from(self.start_date)
+
+    @property
+    def minimum_balance_date(self) -> date:
+        """The first date the minimum balance is reached."""
+        lowest = self.minimum_balance
+        for entry in self.entries:
+            if entry.balance_after == lowest:
+                return entry.day
+        return self.start_date
+
+    def balance_on(self, day: date) -> Decimal:
+        """Projected balance at the end of ``day``."""
+        balance = self.opening_balance
+        for entry in self.entries:
+            if entry.day > day:
+                break
+            balance = entry.balance_after
+        return balance
+
+    def minimum_balance_from(self, day: date) -> Decimal:
+        """Lowest balance reached from ``day`` to the end of the horizon."""
+        lowest = self.balance_on(day)
+        for entry in self.entries:
+            if entry.day >= day:
+                lowest = min(lowest, entry.balance_after)
+        return lowest
+
+    def entries_on(self, day: date) -> tuple[LedgerEntry, ...]:
+        return tuple(entry for entry in self.entries if entry.day == day)
+
+    def trace(self) -> str:
+        """A compact human-readable ledger, one line per entry."""
+        header = (
+            f"{self.user_id}  {self.start_date} .. {self.end_date}  "
+            f"opening {self.opening_balance} {self.home_currency}  "
+            f"floor {self.minimum_balance_to_keep}"
+        )
+        if not self.is_complete:
+            header += "  [INCOMPLETE]"
+        lines = [header]
+        for entry in self.entries:
+            lines.append(
+                f"  {entry.day}  {entry.amount:>14}  {entry.balance_after:>14}  "
+                f"{entry.source_id:<24} {entry.rationale}"
+            )
+        lines.append(
+            f"  minimum {self.minimum_balance} on {self.minimum_balance_date}"
+            f"  ({len(self.blockers)} blocker(s))"
+        )
+        for blocker in self.blockers:
+            day = str(blocker.day) if blocker.day else "-"
+            lines.append(f"  ! {blocker.source_id:<24} {day:<12} {blocker.reason}")
+        return "\n".join(lines)
+
+
+def _counts_as_income(event) -> bool:
+    return (
+        event.event_type in COUNTED_CREDIT_EVENT_TYPES
+        and event.category not in UNCOUNTED_CREDIT_CATEGORIES
+    )
+
+
+def _booking_date(event, start: date) -> date | None:
+    """When this event's cash moves in the forecast, or ``None`` if never.
+
+    Cash that settled before or on the request date is already inside
+    ``current_available_balance`` and is never rebooked. Cash that has not
+    moved yet is reserved no later than the request date, so a pending debit
+    that was due yesterday still reduces what is safe to spend today.
+    """
+    settlement = event.settlement_date
+    if settlement is None:
+        return None
+    if event.status == "settled":
+        return settlement if settlement > start else None
+    return max(settlement, start)
+
+
+def _convert(dataset, amount: Decimal, currency: str, home: str, on_date: date) -> Decimal | None:
+    """Convert to the home currency using the supplied dated rate only."""
+    rate = dataset.exchange_rate(on_date, currency, home)
+    if rate is None:
+        return None
+    return amount * rate
+
+
+def _event_entries(
+    dataset,
+    events: Iterable,
+    *,
+    home_currency: str,
+    start: date,
+    end: date,
+) -> tuple[list[tuple[date, Decimal, str, str, str]], list[ForecastBlocker]]:
+    """Book the supplied rows; return raw movements and unresolved blockers."""
+    movements: list[tuple[date, Decimal, str, str, str]] = []
+    blockers: list[ForecastBlocker] = []
+
+    for event in sorted(events, key=lambda item: item.event_id):
+        if event.status in EXCLUDED_STATUSES or event.status not in CASH_STATUSES:
+            continue
+        if event.direction not in {"debit", "credit"}:
+            continue
+        day = _booking_date(event, start)
+        if day is None or day > end:
+            continue
+        if event.direction == "credit":
+            # Pending credits are money in flight that may never arrive.
+            if event.status == "pending" or not _counts_as_income(event):
+                continue
+        if event.amount is None:
+            blockers.append(
+                ForecastBlocker(
+                    event.event_id,
+                    day,
+                    "amount is blank; resolve from the linked image before forecasting",
+                )
+            )
+            continue
+        converted = _convert(dataset, event.amount, event.currency, home_currency, day)
+        if converted is None:
+            blockers.append(
+                ForecastBlocker(
+                    event.event_id,
+                    day,
+                    f"no supplied {event.currency}->{home_currency} rate on {day}",
+                )
+            )
+            continue
+        signed = -converted if event.direction == "debit" else converted
+        movements.append((day, signed, "event", event.event_id, event.category))
+    return movements, blockers
+
+
+def _rationale_for_event(event, day: date) -> str:
+    if event.status == "pending" and event.direction == "debit":
+        return f"pending debit reserved (due {event.settlement_date})"
+    if event.direction == "credit":
+        return f"{event.status} income counted on its settlement date {event.settlement_date}"
+    return f"{event.status} {event.direction} settling {day}"
+
+
+def _extreme_by_currency(
+    pattern: RecurrencePattern, events_by_id
+) -> dict[str, Decimal] | None:
+    """The conservative observed amount per currency, still unconverted.
+
+    ``None`` when the series contains an occurrence whose amount is still
+    blank: its conservative figure cannot be established until that evidence
+    is resolved, and guessing one would understate the commitment.
+    Conversion is monotone in the rate, so keeping one extreme per currency
+    loses nothing and leaves only a handful of values to convert per date.
+    """
+    extremes: dict[str, Decimal] = {}
+    for event_id in pattern.event_ids:
+        event = events_by_id.get(event_id)
+        if event is None:
+            continue
+        if event.amount is None:
+            return None
+        current = extremes.get(event.currency)
+        extremes[event.currency] = (
+            event.amount
+            if current is None
+            else conservative_amount(pattern.direction, (current, event.amount))
+        )
+    return extremes
+
+
+def _projected_amount(
+    dataset, pattern: RecurrencePattern, extremes, home_currency: str, day: date
+) -> tuple[Decimal | None, str | None]:
+    """The conservative home-currency amount for one projected date.
+
+    Every occurrence is valued at the rate supplied for the date it is
+    projected on, never at a rate carried over from history. A mixed-currency
+    history is compared after each currency has been converted for that same
+    date. Returns ``(None, currency)`` when a needed rate is not supplied.
+    """
+    converted: list[Decimal] = []
+    for currency, amount in sorted(extremes.items()):
+        value = _convert(dataset, amount, currency, home_currency, day)
+        if value is None:
+            return None, currency
+        converted.append(value)
+    return conservative_amount(pattern.direction, converted), None
+
+
+def _recurrence_entries(
+    dataset,
+    events: Sequence,
+    *,
+    home_currency: str,
+    start: date,
+    end: date,
+    booked: Sequence[tuple[date, Decimal, str, str, str]],
+) -> tuple[list[tuple[date, Decimal, str, str, str]], list[ForecastBlocker]]:
+    """Project every recurring series history already supports."""
+    movements: list[tuple[date, Decimal, str, str, str]] = []
+    blockers: list[ForecastBlocker] = []
+    events_by_id = {event.event_id: event for event in events}
+    patterns = recurrence_patterns(events, as_of=start)
+
+    for (category, direction), pattern in sorted(patterns.items()):
+        source_id = f"{category}/{direction}"
+        if direction == "credit":
+            sample = events_by_id.get(pattern.event_ids[-1])
+            if sample is None or not _counts_as_income(sample):
+                continue
+        extremes = _extreme_by_currency(pattern, events_by_id)
+        if not extremes:
+            blockers.append(
+                ForecastBlocker(
+                    source_id,
+                    None,
+                    "recurring series has an unresolved amount; projection withheld",
+                )
+            )
+            continue
+        # A supplied row for the same series already books that occurrence; a
+        # half-cadence window spots the overlap without matching individual
+        # rows to projected dates.
+        window = max(1, pattern.cadence_days // 2)
+        explicit = [
+            day for day, _, _, _, entry_category in booked if entry_category == category
+        ]
+        blocked_currencies: set[str] = set()
+        for day in pattern.occurrences_between(start + timedelta(days=1), end):
+            if any(abs((day - other).days) < window for other in explicit):
+                continue
+            amount, missing_currency = _projected_amount(
+                dataset, pattern, extremes, home_currency, day
+            )
+            if amount is None:
+                if missing_currency not in blocked_currencies:
+                    blocked_currencies.add(missing_currency)
+                    blockers.append(
+                        ForecastBlocker(
+                            source_id,
+                            day,
+                            f"no supplied {missing_currency}->{home_currency} rate "
+                            f"on projected date {day}",
+                        )
+                    )
+                continue
+            signed = -amount if direction == "debit" else amount
+            movements.append((day, signed, "recurrence", source_id, category))
+    return movements, blockers
+
+
+def build_forecast(
+    dataset,
+    user_id: str,
+    start_date: date,
+    *,
+    horizon_days: int = HORIZON_DAYS,
+) -> Forecast:
+    """Project ``user_id``'s balance from ``start_date`` over the horizon."""
+    profile = dataset.profile_by_user.get(user_id)
+    if profile is None:
+        raise KeyError(f"no financial profile for user {user_id!r}")
+
+    events = dataset.events_for(user_id)
+    end = start_date + timedelta(days=horizon_days)
+    home = profile.home_currency
+
+    movements, blockers = _event_entries(
+        dataset, events, home_currency=home, start=start_date, end=end
+    )
+    projected, projection_blockers = _recurrence_entries(
+        dataset,
+        events,
+        home_currency=home,
+        start=start_date,
+        end=end,
+        booked=movements,
+    )
+    blockers += projection_blockers
+
+    events_by_id = {event.event_id: event for event in events}
+    # Same-day debits are applied before credits: the balance must survive the
+    # worst intraday ordering, not the most convenient one.
+    ordered = sorted(
+        movements + projected,
+        key=lambda item: (item[0], 0 if item[1] < 0 else 1, item[3]),
+    )
+
+    entries: list[LedgerEntry] = []
+    balance = profile.current_available_balance
+    for day, amount, source_kind, source_id, category in ordered:
+        balance += amount
+        event = events_by_id.get(source_id) if source_kind == "event" else None
+        rationale = (
+            _rationale_for_event(event, day)
+            if event is not None
+            else f"projected from a settled {category} series"
+        )
+        entries.append(
+            LedgerEntry(
+                day=day,
+                amount=amount,
+                source_kind=source_kind,
+                source_id=source_id,
+                category=category,
+                rationale=rationale,
+                balance_after=balance,
+            )
+        )
+
+    return Forecast(
+        user_id=user_id,
+        home_currency=home,
+        start_date=start_date,
+        end_date=end,
+        opening_balance=profile.current_available_balance,
+        minimum_balance_to_keep=profile.minimum_balance_to_keep,
+        entries=tuple(entries),
+        blockers=tuple(sorted(blockers, key=lambda item: (item.source_id, item.reason))),
+    )
+
+
+def forecast_for_request(dataset, request, *, horizon_days: int = HORIZON_DAYS) -> Forecast:
+    """The baseline forecast a request's decision is made against."""
+    return build_forecast(
+        dataset, request.user_id, request.request_date, horizon_days=horizon_days
+    )

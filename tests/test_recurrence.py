@@ -374,5 +374,121 @@ class RealDatasetPatterns(unittest.TestCase):
         self.assertEqual(first, second)
 
 
+class CalendarMonthProjection(unittest.TestCase):
+    """Monthly settlement keeps its calendar day instead of drifting."""
+
+    def pattern(self, days, **overrides):
+        return detect_recurrence(
+            series(days, **overrides),
+            category=overrides.get("category", "streaming"),
+            direction=overrides.get("direction", "debit"),
+        )
+
+    def test_same_day_series_projects_on_that_day(self) -> None:
+        pattern = self.pattern(["2025-11-15", "2025-12-15", "2026-01-15", "2026-02-15"])
+        self.assertEqual(pattern.month_day, 15)
+        self.assertEqual(
+            pattern.occurrences_between(date(2026, 2, 16), date(2026, 5, 1)),
+            (date(2026, 3, 15), date(2026, 4, 15)),
+        )
+
+    def test_february_does_not_pull_the_anchor_backwards(self) -> None:
+        # A 30-day cadence would land on 14 March; the calendar day is the 15th.
+        pattern = self.pattern(["2025-12-15", "2026-01-15", "2026-02-15"])
+        self.assertEqual(pattern.next_occurrence_after(date(2026, 2, 15)), date(2026, 3, 15))
+
+    def test_month_end_anchor_settles_on_the_last_day(self) -> None:
+        pattern = self.pattern(["2025-10-31", "2025-11-30", "2025-12-31"])
+        self.assertEqual(pattern.month_day, 31)
+        self.assertEqual(
+            pattern.occurrences_between(date(2026, 1, 1), date(2026, 3, 31)),
+            (date(2026, 1, 31), date(2026, 2, 28), date(2026, 3, 31)),
+        )
+
+    def test_day_30_clamps_through_february_and_returns(self) -> None:
+        pattern = self.pattern(
+            ["2025-12-30", "2026-01-30", "2026-02-28", "2026-03-30"]
+        )
+        self.assertEqual(pattern.month_day, 30)
+        self.assertEqual(
+            pattern.occurrences_between(date(2026, 3, 31), date(2026, 5, 31)),
+            (date(2026, 4, 30), date(2026, 5, 30)),
+        )
+
+    def test_projection_from_february_returns_to_the_anchor(self) -> None:
+        pattern = self.pattern(["2025-12-30", "2026-01-30", "2026-02-28"])
+        self.assertEqual(pattern.month_day, 30)
+        self.assertEqual(
+            pattern.next_occurrence_after(date(2026, 2, 28)), date(2026, 3, 30)
+        )
+
+    def test_a_short_month_date_that_is_not_the_clamp_is_not_monthly(self) -> None:
+        # March has 31 days, so a 30th-anchored series cannot settle on the 28th.
+        pattern = self.pattern(
+            ["2025-12-30", "2026-01-30", "2026-02-28", "2026-03-28"]
+        )
+        self.assertIsNone(pattern.month_day)
+
+    def test_irregular_days_stay_on_the_day_cadence(self) -> None:
+        pattern = self.pattern(["2025-10-02", "2025-11-05", "2025-12-04"])
+        self.assertIsNone(pattern.month_day)
+        self.assertEqual(pattern.cadence_cycle, (32,))
+
+    def test_weekly_series_is_not_monthly(self) -> None:
+        pattern = self.pattern(["2025-10-06", "2025-10-13", "2025-10-20", "2025-10-27"])
+        self.assertIsNone(pattern.month_day)
+        self.assertEqual(pattern.cadence_days, 7)
+
+
+class AlternatingCadence(unittest.TestCase):
+    """Semi-monthly series: two exact gaps, projected in their own phase."""
+
+    #: Gaps alternate exactly 22 and 9 days, which no single median describes.
+    SEMI_MONTHLY = [
+        "2025-10-01", "2025-10-23", "2025-11-01", "2025-11-23",
+        "2025-12-02", "2025-12-24", "2026-01-02",
+    ]
+
+    def pattern(self, days=None, **overrides):
+        events = series(days or self.SEMI_MONTHLY, **overrides)
+        return detect_recurrence(
+            events,
+            category=overrides.get("category", "streaming"),
+            direction=overrides.get("direction", "debit"),
+        )
+
+    def test_both_gaps_are_kept(self) -> None:
+        pattern = self.pattern()
+        self.assertIsNotNone(pattern)
+        self.assertEqual(pattern.cadence_cycle, (22, 9))
+
+    def test_projection_continues_the_actual_next_phase(self) -> None:
+        pattern = self.pattern()
+        # The last observation closed a 9-day gap, so a 22-day one comes next.
+        self.assertEqual(pattern.next_occurrence_after(date(2026, 1, 2)), date(2026, 1, 24))
+        self.assertEqual(
+            pattern.occurrences_between(date(2026, 1, 3), date(2026, 2, 15)),
+            (date(2026, 1, 24), date(2026, 2, 2)),
+        )
+
+    def test_phase_follows_the_last_observation(self) -> None:
+        # One occurrence fewer: the series now ends after a 22-day gap, so the
+        # next payment is 9 days out, not another 22.
+        pattern = self.pattern(self.SEMI_MONTHLY[:-1])
+        self.assertEqual(pattern.cadence_cycle, (9, 22))
+        self.assertEqual(pattern.next_occurrence_after(date(2025, 12, 24)), date(2026, 1, 2))
+
+    def test_single_cadence_series_keep_one_gap(self) -> None:
+        pattern = self.pattern(["2025-10-12", "2025-11-12", "2025-12-12"])
+        self.assertEqual(pattern.cadence_cycle, (30,))
+        self.assertEqual(pattern.cadence_days, 30)
+
+    def test_irregular_gaps_are_still_rejected(self) -> None:
+        events = series(["2025-10-01", "2025-10-20", "2025-11-02", "2025-12-30"])
+        self.assertIsNone(
+            detect_recurrence(events, category="streaming", direction="debit")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

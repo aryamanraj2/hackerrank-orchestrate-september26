@@ -9,6 +9,7 @@ predictions are written.
     python3 code/main.py               # dataset summary + contract validation
     python3 code/main.py --validate    # same, stated explicitly
     python3 code/main.py --check-output output.csv   # + semantic recommendation checks
+    python3 code/main.py --forecast request_26       # print one baseline cash ledger
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from cashflow import forecast_for_request  # noqa: E402
 from dataset_loader import Dataset, find_dataset_root, load_dataset  # noqa: E402
 from output_schema import REQUIRED_OUTPUT_COLUMNS, validate_output_row_values  # noqa: E402
 from recommendation_schema import (  # noqa: E402
@@ -172,6 +174,23 @@ def run_validation(dataset_root: Path | None, output_path: Path | None, issue_li
     return 1
 
 
+def show_forecast(dataset_root: Path | None, request_id: str) -> int:
+    """Print one request's baseline 90-day ledger. Read-only diagnostic."""
+    try:
+        dataset = load_dataset(dataset_root)
+    except DatasetError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    request = dataset.request_by_id.get(request_id) or getattr(
+        dataset.sample_request_by_id.get(request_id), "request", None
+    )
+    if request is None:
+        print(f"unknown request_id: {request_id}", file=sys.stderr)
+        return 1
+    print(forecast_for_request(dataset, request).trace())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="main.py",
@@ -203,6 +222,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--forecast",
+        default=None,
+        metavar="REQUEST_ID",
+        help="print the baseline 90-day cash ledger for one request and exit",
+    )
+    parser.add_argument(
         "--max-issues",
         type=int,
         default=DEFAULT_ISSUE_LIMIT,
@@ -221,6 +246,8 @@ def main(argv: list[str] | None = None) -> int:
         except DatasetError as error:
             print(str(error), file=sys.stderr)
             return 1
+    if args.forecast:
+        return show_forecast(dataset_root, args.forecast)
     return run_validation(dataset_root, args.check_output, args.max_issues)
 
 
