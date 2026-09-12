@@ -19,9 +19,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from evidence_policy import IncomeHold, income_holds
+from image_evidence import IMAGE_AMOUNTS_PATH, apply_image_evidence
 from recurrence import (
     RecurrencePattern,
     conservative_amount,
@@ -467,13 +469,20 @@ def build_forecast(
     *,
     horizon_days: int = HORIZON_DAYS,
     request=None,
+    image_evidence: Path | None = IMAGE_AMOUNTS_PATH,
 ) -> Forecast:
-    """Project ``user_id``'s balance from ``start_date`` over the horizon."""
+    """Project ``user_id``'s balance from ``start_date`` over the horizon.
+
+    ``image_evidence`` is the resolved image-amount artifact; blank amounts it
+    validly resolves are filled in before anything is booked or projected.
+    """
     profile = dataset.profile_by_user.get(user_id)
     if profile is None:
         raise KeyError(f"no financial profile for user {user_id!r}")
 
-    events = dataset.events_for(user_id)
+    events, evidence_notes = apply_image_evidence(
+        dataset, dataset.events_for(user_id), user_id, image_evidence
+    )
     end = start_date + timedelta(days=horizon_days)
     home = profile.home_currency
 
@@ -491,6 +500,7 @@ def build_forecast(
         holds=holds,
     )
     blockers += projection_blockers
+    notes += [ForecastNote(source_id, reason) for source_id, reason in evidence_notes]
 
     events_by_id = {event.event_id: event for event in events}
     # Same-day debits are applied before credits: the balance must survive the
