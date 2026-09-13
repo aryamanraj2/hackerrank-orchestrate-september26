@@ -6,14 +6,14 @@ Final full-dataset run: **250 evaluation requests** from `dataset/requests.csv`.
 
 | Step | When it runs | Model calls | Tokens |
 |---|---|---:|---:|
-| Prediction (`python3 main.py --predict`) | every run | **0** | **0** |
-| Image-amount resolution (`evidence/resolve_images.py`) | once, offline, before prediction | 16 | 2,767,537 |
+| Prediction (`python3 code/main.py --predict`) | every run | **0** | **0** |
+| Image-amount resolution (`code/evidence/resolve_images.py`) | once, offline, before prediction | 16 | 2,767,537 |
 
 The prediction step is deterministic, standard-library Python and makes **no model
-or network calls**. It reads the committed artifact `evidence/image_amounts.json`,
+or network calls**. It reads the committed artifact `code/evidence/image_amounts.json`,
 produced once by the resolver for the 16 `images.csv` rows linked to a financial
 event with a blank amount. Exact per-call figures are recorded in
-`evidence/image_amounts_usage.json`.
+`code/evidence/image_amounts_usage.json`.
 
 ## 2. Final run (the one used for `output.csv`)
 
