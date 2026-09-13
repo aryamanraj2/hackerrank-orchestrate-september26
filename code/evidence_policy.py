@@ -389,8 +389,33 @@ INCOME_TEMPLATES: tuple[tuple[str, str, tuple[str, ...], str, re.Pattern[str]], 
          rf"remaining confirmed monthly salary is {_AMOUNT}"),
         ("remaining_salary_confirmed", FROM_DATE, ("salary",), "",
          rf"Sisa gaji bulanan yang dikonfirmasi adalah {_AMOUNT}"),
+        # T01 first salary with a confirmed credit date.
+        ("first_income", NEXT_ONLY, SALARY_WORDS, "",
+         rf"Your first salary will be {_AMOUNT}\. The confirmed credit date is {_DATE}"),
+        ("first_income", NEXT_ONLY, SALARY_WORDS, "",
+         rf"Gaji pertama Anda sebesar {_AMOUNT}\. Tanggal kredit yang dikonfirmasi adalah {_DATE}"),
+        # T02 first salary from a new employer.
+        ("first_income", NEXT_ONLY, SALARY_WORDS, "",
+         rf"Your first salary from the new employer is {_AMOUNT}\. It is confirmed for {_DATE}"),
+        ("first_income", NEXT_ONLY, SALARY_WORDS, "",
+         rf"Gaji pertama dari perusahaan baru adalah {_AMOUNT}\. Pembayaran sudah dikonfirmasi untuk {_DATE}"),
+        # T03 first salary scheduled.
+        ("first_income", NEXT_ONLY, SALARY_WORDS, "",
+         rf"Your first salary of {_AMOUNT} is scheduled for {_DATE}"),
+        ("first_income", NEXT_ONLY, SALARY_WORDS, "",
+         rf"Gaji pertama Anda sebesar {_AMOUNT} dijadwalkan pada {_DATE}"),
+        # T06 salary resumes (no Indonesian wording exists in the dataset). The
+        # childcare sentence in the same notice states no amount.
+        ("income_resumes", NEXT_ONLY, SALARY_WORDS, "",
+         rf"Regular salary of {_AMOUNT} resumes on {_DATE}"),
+        ("unpriced_commitment", NEXT_ONLY, (), "",
+         r"A new recurring childcare payment begins in the same month"),
     )
 )
+
+#: Facts that book one dated salary credit for the user's salary income as a
+#: whole, rather than adjusting a projected stream.
+DATED_CREDIT_KINDS = frozenset({"first_income", "income_resumes"})
 
 
 @dataclass(frozen=True)

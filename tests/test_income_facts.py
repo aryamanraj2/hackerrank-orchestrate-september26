@@ -289,6 +289,93 @@ class ApplicabilityTests(unittest.TestCase):
         self.assertEqual(credits(forecast([notice(text)])), normal(2000, 2000, 2000))
 
 
+def salary_credits(result):
+    """Every salary credit in the ledger, booked rows included."""
+    return [(entry.day, entry.amount) for entry in result.entries if entry.amount > 0 and entry.category == "salary"]
+
+
+class DatedSalaryTests(unittest.TestCase):
+    TEMPLATES = (
+        "Your first salary will be ZAR 2500. The confirmed credit date is 2026-01-15.",
+        "Gaji pertama Anda sebesar ZAR 2500. Tanggal kredit yang dikonfirmasi adalah 2026-01-15.",
+        "Your first salary from the new employer is ZAR 2500. It is confirmed for 2026-01-15.",
+        "Gaji pertama dari perusahaan baru adalah ZAR 2500. Pembayaran sudah dikonfirmasi untuk 2026-01-15.",
+        "Your first salary of ZAR 2500 is scheduled for 2026-01-15.",
+        "Gaji pertama Anda sebesar ZAR 2500 dijadwalkan pada 2026-01-15.",
+        # T06 has no Indonesian wording in the dataset.
+        "Regular salary of ZAR 2500 resumes on 2026-01-15. A new recurring childcare payment begins in the same month.",
+    )
+
+    def test_each_template_books_the_dated_salary_and_continues_monthly(self):
+        # Two settled paydays: no projectable schedule of their own.
+        incomes = series("event_f", "First-job payroll", days=HISTORY[2:])
+        self.assertEqual(credits(forecast([], incomes=incomes)), [])
+        for text in self.TEMPLATES:
+            with self.subTest(text=text):
+                result = forecast([notice(text)], incomes=incomes)
+                self.assertEqual(credits(result), normal(2500, 2500, 2500))
+                self.assertTrue(cited(result))
+
+    def test_childcare_sentence_books_nothing(self):
+        result = forecast([notice(self.TEMPLATES[-1])], incomes=[])
+        self.assertTrue(any("states no amount" in reason for reason in cited(result)))
+        debits = lambda f: [(e.day, e.amount, e.source_id) for e in f.entries if e.amount < 0]
+        self.assertEqual(debits(result), debits(forecast([], incomes=[])))
+
+    def test_it_replaces_the_projected_previous_employer_pay_one_for_one(self):
+        result = forecast([notice(self.TEMPLATES[2])], incomes=series("event_p", "Previous employer payroll"))
+        self.assertEqual(credits(result), normal(2500, 2500, 2500))
+
+    def test_a_date_before_the_request_is_only_noted(self):
+        text = "Your first salary will be ZAR 2500. The confirmed credit date is 2026-01-02."
+        result = forecast([notice(text, sent_at="2026-01-01T09:30:00Z")], incomes=[])
+        self.assertEqual(credits(result), [])
+        self.assertTrue(any("before the request date" in reason for reason in cited(result)))
+
+    def test_a_missing_rate_is_a_blocker_naming_the_message(self):
+        result = forecast([notice("Your first salary will be EUR 100. The confirmed credit date is 2026-01-15.")], incomes=[])
+        self.assertFalse(result.is_complete)
+        self.assertTrue(all("message_n" in blocker.reason for blocker in result.blockers))
+        self.assertEqual(credits(result), [])
+
+    def test_a_scheduled_salary_without_a_schedule_continues_monthly(self):
+        incomes = [income("event_r", "2025-12-15", "Prorated first salary", amount="900")]
+        scheduled = income("event_n", "2026-01-15", "Next confirmed salary", amount="2300")
+        scheduled["status"] = "scheduled"
+        result = forecast([], incomes=incomes + [scheduled])
+        self.assertEqual(salary_credits(result), normal(2300, 2300, 2300))
+
+
+class FinalPayrollTests(unittest.TestCase):
+    FINAL = income("event_z", "2025-12-15", "Final employer payroll")
+
+    def history(self):
+        return series("event_p", "Payroll credit", days=HISTORY[:3]) + [dict(self.FINAL)]
+
+    def test_final_payroll_ends_later_projections(self):
+        baseline = forecast([], incomes=series("event_p", "Payroll credit"))
+        result = forecast([], incomes=self.history())
+        self.assertEqual(credits(result), [])
+        self.assertTrue(any("event_z" in note.reason for note in result.notes))
+        self.assertEqual(result.opening_balance, baseline.opening_balance)
+
+    def test_a_later_scheduled_credit_keeps_the_projection(self):
+        later = income("event_l", "2026-02-15", "Payroll credit")
+        later["status"] = "scheduled"
+        result = forecast([], incomes=self.history() + [later])
+        self.assertTrue(credits(result))
+        self.assertFalse(any("event_z" in note.reason for note in result.notes))
+
+    def test_a_later_settled_credit_keeps_the_projection(self):
+        later = income("event_l", "2026-01-02", "Payroll credit")
+        result = forecast([], incomes=self.history() + [later])
+        self.assertFalse(any("event_z" in note.reason for note in result.notes))
+
+    def test_final_payroll_and_employment_ended_notice_agree(self):
+        result = forecast([notice("Your employment has ended.")], incomes=self.history())
+        self.assertEqual(credits(result), [])
+
+
 class RealDatasetCoverageTests(unittest.TestCase):
     def test_every_in_scope_template_message_is_matched(self):
         if not REAL_DATASET.is_dir():
@@ -313,6 +400,9 @@ class RealDatasetCoverageTests(unittest.TestCase):
                 "payday_moved": 7,
                 "income_ended": 20,
                 "remaining_salary_confirmed": 7,
+                "first_income": 27,
+                "income_resumes": 8,
+                "unpriced_commitment": 8,
             },
         )
 

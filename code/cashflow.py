@@ -16,6 +16,7 @@ No recommendation, payment option or spending change is chosen here.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from evidence_policy import (
+    DATED_CREDIT_KINDS,
     FROM_DATE,
     IncomeFact,
     IncomeHold,
@@ -363,7 +365,19 @@ def _recurrence_entries(
     patterns = recurrence_patterns(events, as_of=start)
     projected: list[tuple] = []
     credit_candidates: list[tuple] = []
-    facts_by_series = _facts_by_series(facts, patterns, events, events_by_id, notes)
+    for fact in facts:
+        if fact.kind == "unpriced_commitment":
+            notes.append(ForecastNote(fact.message_id, f"{fact.message_id}: a new commitment states no amount; nothing booked"))
+    dated = _dated_salary_credits(
+        dataset, [fact for fact in facts if fact.kind in DATED_CREDIT_KINDS], events, patterns,
+        home_currency=home_currency, start=start, end=end, notes=notes, blockers=blockers,
+    )
+    movements += dated
+    facts_by_series = _facts_by_series(
+        [fact for fact in facts if fact.kind not in DATED_CREDIT_KINDS | {"unpriced_commitment"}],
+        patterns, events, events_by_id, notes,
+    )
+    income_ends = _final_payroll_ends(events)
 
     for (category, direction, stream), pattern in sorted(patterns.items()):
         source_id = f"{category}/{direction}" + (f"/{stream}" if stream else "")
@@ -406,6 +420,12 @@ def _recurrence_entries(
                 ),
             )
             notes += fact_notes
+            ended = income_ends.get(category)
+            if ended is not None:
+                days = [day for day in days if day <= ended[0]]
+                notes.append(
+                    ForecastNote(source_id, f"final payroll {ended[1]} settled {ended[0]}; nothing projected after it")
+                )
         candidates = [
             (day, source_id, category, group, window, pattern, extremes, direction, overrides.get(day))
             for day in days
@@ -430,7 +450,7 @@ def _recurrence_entries(
     # that projection's half-cadence window, and for no more than one.
     suppressed: set[int] = set()
     for day, _, _, event_id, category, group in sorted(
-        (item for item in booked if item[1] > 0), key=lambda item: (item[0], item[3])
+        [item for item in booked if item[1] > 0] + dated, key=lambda item: (item[0], item[3])
     ):
         matches = [
             (abs((candidate[0] - day).days), candidate[3] != group, candidate[0], candidate[1], index)
@@ -646,9 +666,7 @@ def _apply_income_facts(
                 if (above := history(fact.amount, fact.currency, day)) is not None
             }
         for day in reached:
-            if day in capped:
-                overrides.pop(day, None)
-            else:
+            if day not in capped:
                 overrides[day] = (fact.amount, fact.currency, fact.message_id)
         for above in sorted(set(capped.values())):
             note(fact, f"confirms {stated}, above settled history {above}; history amount kept (safer)")
@@ -657,6 +675,78 @@ def _apply_income_facts(
             when = ", ".join(str(day) for day in applied) or "no projected occurrence"
             note(fact, f"{fact.kind} {stated} applied to {when}")
     return days, overrides, notes
+
+
+#: The category a dated salary notice speaks for: the user's salary as a whole.
+SALARY_CATEGORY = "salary"
+
+def _dated_salary_credits(dataset, facts, events, patterns, *, home_currency, start, end, notes, blockers):
+    """Monthly salary credits dated by a notice or by a supplied scheduled row.
+
+    A first or resumed salary is booked on its stated date and continues at
+    that amount on the same day of month through the horizon. A scheduled
+    salary row in a category with no projectable income schedule continues the same way
+    (the row itself is already booked). Each credit is that cycle's pay, so the
+    caller lets it replace the nearest projected same-category credit, one for
+    one. Not capped: a dated scheduled credit does not contradict history.
+    """
+    # (first day, amount, currency, source, months to skip)
+    seeds = []
+    for fact in facts:
+        day = fact.effective_date
+        if not start <= day <= end:
+            where = "before the request date" if day < start else "after the forecast"
+            notes.append(ForecastNote(fact.message_id, f"{fact.message_id}: {fact.kind} on {day} is {where}; not booked"))
+            continue
+        seeds.append((day, fact.amount, fact.currency, fact.message_id, 0))
+    for event in events:
+        if (
+            event.status == "scheduled"
+            and event.category == SALARY_CATEGORY
+            and _counts_as_income(event)
+            and event.amount is not None
+            and event.settlement_date is not None
+            and start <= event.settlement_date <= end
+            and not any(key[:2] == (event.category, "credit") for key in patterns)
+        ):
+            seeds.append((event.settlement_date, event.amount, event.currency, event.event_id, 1))
+    movements = []
+    for first, amount, currency, source, skip in sorted(seeds, key=lambda seed: (seed[0], seed[3])):
+        source_id = f"{SALARY_CATEGORY}/credit/{source}"
+        months = skip
+        while (day := _anchored(first, months, first.day)) <= end:
+            converted = _convert(dataset, amount, currency, home_currency, day)
+            if converted is None:
+                blockers.append(ForecastBlocker(source_id, day, f"{source} states {currency} {amount} but no supplied {currency}->{home_currency} rate on {day}"))
+            else:
+                movements.append((day, converted, "message", source_id, SALARY_CATEGORY, SALARY_CATEGORY))
+            months += 1
+        notes.append(ForecastNote(source_id, f"{source}: dated salary {currency} {amount} from {first}, continued monthly"))
+    return movements
+
+
+FINAL_PAYROLL = re.compile(r"\bfinal\b", re.IGNORECASE)
+
+
+def _final_payroll_ends(events) -> dict[str, tuple[date, str]]:
+    """Per category, the settled final payroll that no later income follows."""
+    income = [
+        event for event in events
+        if event.direction == "credit" and _counts_as_income(event) and event.settlement_date is not None
+    ]
+    ends: dict[str, tuple[date, str]] = {}
+    for event in income:
+        if event.status != "settled" or not FINAL_PAYROLL.search(event.description):
+            continue
+        if any(
+            other.category == event.category
+            and other.status in {"settled", "scheduled"}
+            and other.settlement_date > event.settlement_date
+            for other in income
+        ):
+            continue
+        ends[event.category] = (event.settlement_date, event.event_id)
+    return ends
 
 
 #: A single settled credit is a one-off. Two or more in the same stream look
@@ -755,6 +845,7 @@ def build_forecast(
         rationale = (
             _rationale_for_event(event, day)
             if event is not None
+            else "dated salary credit" if source_kind == "message"
             else f"projected from a settled {category} series"
         )
         entries.append(
