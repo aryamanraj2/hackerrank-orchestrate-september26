@@ -100,9 +100,12 @@ dataset_loader -> cashflow.forecast_for_request -> engine.recommend -> output.cs
 - **Opening balance** is `current_available_balance` on `request_date`.
 - **Forecast window:** 86 days from `request_date` (`cashflow.HORIZON_DAYS`).
   Commitments on later days are outside the safety check.
-- **Pending and scheduled debits are reserved**, no later than the request date.
-  Pending credits, windfalls (bonuses, commissions, lottery), refunds, and
-  unrealized investment gains are never counted as cash.
+- **Pending and scheduled debits are reserved** on their settlement date, or on
+  the request date if that date has already passed. Pending credits (including
+  pending bonuses and commissions), windfall-category credits such as prize
+  proceeds, refunds, investment sales, and unrealized investment gains are never
+  counted as cash. Settled salary-category history, including recurring
+  commissions, is projected like any other income series.
 - **Recurring series** come only from settled history. Debits are projected at
   the mean of their settled amounts, credits at the median, per currency before
   conversion. An occurrence due on the request date is included. A supplied row
@@ -220,9 +223,9 @@ history amounts.
 | Window | Scores | Total |
 |---|---|---:|
 | 90 days | 3/20/21/21/17/21 | 103 |
-| 60 days | worse | — |
+| 60 days | 4/19/20/18/15/22 | 98 |
 | 76–86 days | 4/21/22/22/19/22 | 110 |
-| 87 days | 3/21/22/22/18/21 | — |
+| 87 days | 3/21/22/22/18/21 | 107 |
 | 86 days + lapsed-income rule | 4/22/23/23/20/22 | 114 |
 
 Three public samples (`request_08`, `request_12`, `request_13`) have commitments
