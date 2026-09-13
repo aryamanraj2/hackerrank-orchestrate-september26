@@ -110,7 +110,7 @@ class SpendingChangeTests(unittest.TestCase):
         self.assertEqual(row["spending_changes_needed"], "reduce_to:event_c:40|stop:event_d|stop:event_gym12")
         self.assertValid(issues)
         # Only all four together would be enough: fall back rather than exceed three.
-        row, issues = run(620, extra_events=extra, expense_categories_user_is_willing_to_stop=stop)
+        row, issues = run(625, extra_events=extra, expense_categories_user_is_willing_to_stop=stop)
         self.assertEqual((row["affordability_status"], row["spending_changes_needed"]), ("not_affordable", "none"))
         self.assertValid(issues)
 

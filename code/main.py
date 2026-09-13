@@ -9,7 +9,7 @@ predictions are written.
     python3 code/main.py               # dataset summary + contract validation
     python3 code/main.py --validate    # same, stated explicitly
     python3 code/main.py --check-output output.csv   # + semantic recommendation checks
-    python3 code/main.py --forecast request_26       # print one baseline cash ledger
+    python3 code/main.py --forecast REQUEST_ID       # print one baseline cash ledger
     python3 code/main.py --predict                   # write output.csv at the repo root
 """
 
@@ -178,7 +178,7 @@ def run_validation(dataset_root: Path | None, output_path: Path | None, issue_li
 
 
 def show_forecast(dataset_root: Path | None, request_id: str) -> int:
-    """Print one request's baseline 90-day ledger. Read-only diagnostic."""
+    """Print one request's baseline forecast ledger. Read-only diagnostic."""
     try:
         dataset = load_dataset(dataset_root)
     except DatasetError as error:
@@ -240,7 +240,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--forecast",
         default=None,
         metavar="REQUEST_ID",
-        help="print the baseline 90-day cash ledger for one request and exit",
+        help="print the baseline forecast cash ledger for one request and exit",
     )
     parser.add_argument(
         "--predict",

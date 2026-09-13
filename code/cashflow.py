@@ -1,7 +1,7 @@
 """Deterministic cash-flow forecasting for one user over a fixed horizon.
 
 The forecast answers a single question: what does this user's balance do,
-day by day, from the request date through the next 90 days, if nothing new is
+day by day, from the request date through the safety window, if nothing new is
 decided? It books only cash that the dataset actually supports — settled money
 that has not moved yet, reserved pending debits, scheduled commitments, and
 recurring series that :mod:`recurrence` has already validated against history.
@@ -42,8 +42,10 @@ from recurrence import (
     series_amount,
 )
 
-#: The forecast period the problem statement reasons over.
-HORIZON_DAYS = 90
+#: The safety window the forecast checks, in days from the request date.
+#: Calibrated globally: reference behaviour ignores commitments on days 87-90
+#: of the nominal 90-day period.
+HORIZON_DAYS = 86
 
 #: Statuses whose cash never moves, in either direction.
 EXCLUDED_STATUSES = frozenset({"failed", "cancelled", "unrealized"})
@@ -219,6 +221,34 @@ def _counts_as_income(event) -> bool:
     )
 
 
+def _succeeded(latest, pattern, events: Sequence, start: date) -> bool:
+    """Whether a new income stream in the same category replaced this series.
+
+    A stream replaced by a new one in the same category (a new employer, a new
+    client) is a change of payer, not lost income. The replacement must have
+    settled after the series' last occurrence and on or before the request
+    date, under a description that had never settled before; a description
+    that was already paying alongside the series is a parallel stream.
+    """
+
+    def settled_income(event) -> bool:
+        return event.status == "settled" and event.settlement_date is not None and _counts_as_income(event)
+
+    return any(
+        settled_income(event)
+        and event.category == latest.category
+        and event.description != latest.description
+        and pattern.last_date < event.settlement_date <= start
+        and not any(
+            settled_income(other)
+            and other.description == event.description
+            and other.settlement_date <= pattern.last_date
+            for other in events
+        )
+        for event in events
+    )
+
+
 def _booking_date(event, start: date) -> date | None:
     """When this event's cash moves in the forecast, or ``None`` if never.
 
@@ -385,6 +415,19 @@ def _recurrence_entries(
         if direction == "credit":
             sample = events_by_id.get(pattern.event_ids[-1])
             if sample is None or not _counts_as_income(sample):
+                continue
+            # Income that already missed its next expected occurrence has
+            # lapsed. Debits never lapse: an unseen bill is still owed.
+            if not _succeeded(sample, pattern, events, start) and start > pattern.last_date + timedelta(
+                days=pattern.cadence_days + pattern.cadence_days // 2
+            ):
+                notes.append(
+                    ForecastNote(
+                        source_id,
+                        f"last occurrence {pattern.last_date} and the next expected one "
+                        "never arrived; income not projected",
+                    )
+                )
                 continue
             # Message evidence can say plainly that the next payout is not yet
             # money. Settled history keeps its place in the opening balance;

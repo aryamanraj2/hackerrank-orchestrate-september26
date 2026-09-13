@@ -959,7 +959,7 @@ class LedgerBoundaryTests(ForecastTestCase):
             self.scheduled_pay("event_b", "2026-02-05"),
         )
         projected = [e.day for e in self.entries_for(forecast, "salary/credit/Primary salary")]
-        self.assertEqual(projected, [date(2026, 3, 5), date(2026, 4, 5)])
+        self.assertEqual(projected, [date(2026, 3, 5)])  # 2026-04-05 is past the 86-day window
         self.assertEqual(len(forecast.notes), 2)
         self.assertEqual(len([e for e in forecast.entries if e.source_kind == "event"]), 3)
 

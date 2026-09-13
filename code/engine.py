@@ -20,7 +20,7 @@ from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Sequence
 
-from cashflow import forecast_for_request, same_day_order
+from cashflow import HORIZON_DAYS, forecast_for_request, same_day_order
 from output_schema import (
     MAX_SPENDING_CHANGES,
     NO_PAYMENT_PLAN,
@@ -276,7 +276,7 @@ def _explain(candidate, forecast, request, safe, earliest, baseline, changes=())
         elif earliest is None:
             reason = (
                 f"Only {cur} {money(safe)} is safe today and the full {requested} "
-                "does not become safe as one payment within the 90-day forecast"
+                f"does not become safe as one payment within the {HORIZON_DAYS}-day forecast"
             )
         elif earliest > request.desired_completion_date:
             reason = (

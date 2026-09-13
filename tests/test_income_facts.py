@@ -347,10 +347,12 @@ class DatedSalaryTests(unittest.TestCase):
 
 
 class FinalPayrollTests(unittest.TestCase):
-    FINAL = income("event_z", "2025-12-15", "Final employer payroll")
+    # The final payroll follows an on-time series (last payday 2025-12-15), so
+    # the lapse rule does not already hide the stream.
+    FINAL = income("event_z", "2026-01-02", "Final employer payroll")
 
     def history(self):
-        return series("event_p", "Payroll credit", days=HISTORY[:3]) + [dict(self.FINAL)]
+        return series("event_p", "Payroll credit") + [dict(self.FINAL)]
 
     def test_final_payroll_ends_later_projections(self):
         baseline = forecast([], incomes=series("event_p", "Payroll credit"))
@@ -367,13 +369,80 @@ class FinalPayrollTests(unittest.TestCase):
         self.assertFalse(any("event_z" in note.reason for note in result.notes))
 
     def test_a_later_settled_credit_keeps_the_projection(self):
-        later = income("event_l", "2026-01-02", "Payroll credit")
+        later = income("event_l", "2026-01-04", "Payroll credit")
         result = forecast([], incomes=self.history() + [later])
         self.assertFalse(any("event_z" in note.reason for note in result.notes))
 
     def test_final_payroll_and_employment_ended_notice_agree(self):
         result = forecast([notice("Your employment has ended.")], incomes=self.history())
         self.assertEqual(credits(result), [])
+
+
+class WindowAndLapseTests(unittest.TestCase):
+    def debit_series(self, category, days, amount="30"):
+        row = default_tables()["financial_events"][3]  # a settled monthly subscription
+        return [
+            {**row, "event_id": f"event_{category}{i}", "category": category, "amount": amount,
+             "event_date": day, "settlement_date": day}
+            for i, day in enumerate(days)
+        ]
+
+    def test_a_lapsed_credit_is_not_projected_and_noted(self):
+        # Last payday 2025-11-15 on a monthly cadence: the 2025-12-15 payday
+        # never arrived, so nothing is projected from the 2026-01-05 request.
+        result = forecast([], incomes=series("event_p", "Payroll credit", days=HISTORY[:3]))
+        self.assertEqual(credits(result), [])
+        self.assertIn(
+            "last occurrence 2025-11-15 and the next expected one never arrived; income not projected",
+            [note.reason for note in result.notes if note.source_id == "salary/credit/Payroll credit"],
+        )
+
+    def test_a_credit_replaced_by_a_new_stream_is_still_projected(self):
+        # The old payroll stopped after 2025-11-15, but a new payroll in the
+        # same category first settled on 2025-12-20: a change of payer.
+        incomes = series("event_p", "Previous employer payroll", days=HISTORY[:3]) + [
+            income("event_n", "2025-12-20", "New employer payroll")
+        ]
+        result = forecast([], incomes=incomes)
+        self.assertEqual(credits(result), normal(2000, 2000, 2000))
+        self.assertFalse(any("never arrived" in note.reason for note in result.notes))
+
+    def test_a_parallel_stream_is_not_a_successor(self):
+        # The other description already settled before the lapsed series'
+        # last payday, so it ran alongside it and replaced nothing.
+        incomes = series("event_p", "Payroll credit", days=HISTORY[:3]) + [
+            income("event_s1", "2025-10-01", "Side payroll"),
+            income("event_s2", "2025-12-20", "Side payroll"),
+        ]
+        result = forecast([], incomes=incomes)
+        self.assertEqual(credits(result), [])
+        self.assertIn(
+            "last occurrence 2025-11-15 and the next expected one never arrived; income not projected",
+            [note.reason for note in result.notes if note.source_id == "salary/credit/Payroll credit"],
+        )
+
+    def test_an_on_time_credit_is_still_projected(self):
+        result = forecast([], incomes=series("event_p", "Payroll credit"))
+        self.assertEqual(credits(result), normal(2000, 2000, 2000))
+        self.assertFalse(any("never arrived" in note.reason for note in result.notes))
+
+    def test_debits_never_lapse(self):
+        rows = self.debit_series("gym", ("2025-08-20", "2025-09-20", "2025-10-20"))
+        result = forecast([], incomes=rows)
+        self.assertEqual(
+            [entry.day for entry in result.entries if entry.source_id == "gym/debit"],
+            [date(2026, 1, 20), date(2026, 2, 20), date(2026, 3, 20)],
+        )
+
+    def test_the_window_ends_on_day_86(self):
+        rows = self.debit_series("gym", ("2025-10-01", "2025-11-01", "2025-12-01")) + self.debit_series(
+            "club", ("2025-10-02", "2025-11-02", "2025-12-02")
+        )
+        result = forecast([], incomes=rows)
+        self.assertEqual(result.end_date, date(2026, 4, 1))
+        days = lambda source: [entry.day for entry in result.entries if entry.source_id == source]
+        self.assertEqual(days("gym/debit")[-1], date(2026, 4, 1))  # day 86 is checked
+        self.assertEqual(days("club/debit")[-1], date(2026, 3, 2))  # day 87 is not
 
 
 class RealDatasetCoverageTests(unittest.TestCase):
