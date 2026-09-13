@@ -7,20 +7,28 @@ each movement, ordered by :func:`cashflow.same_day_order` (credits before
 debits within a day). A plan is safe
 only when no checkpoint falls below ``minimum_balance_to_keep``.
 
-No spending changes are proposed yet; every row carries ``none``.
+Spending changes are proposed only when no plan completes by the deadline
+without them (see :func:`_plan_with_changes`).
 """
 
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Sequence
 
 from cashflow import forecast_for_request, same_day_order
-from output_schema import NO_PAYMENT_PLAN, NO_SPENDING_CHANGES, REQUIRED_OUTPUT_COLUMNS
+from output_schema import (
+    MAX_SPENDING_CHANGES,
+    NO_PAYMENT_PLAN,
+    NO_SPENDING_CHANGES,
+    REQUIRED_OUTPUT_COLUMNS,
+)
+from recommendation_schema import _validate_spending_change
+from recurrence import recurrence_patterns
 
 CENT = Decimal("0.01")
 
@@ -146,6 +154,104 @@ def _candidates(forecast, request, profile, options, safe, earliest) -> list[Can
     return candidates
 
 
+#: Methods a changed forecast may recommend. ``wait`` and ``partial_payment``
+#: are dated by the earliest full-payment date, which stays computed on the
+#: unchanged forecast, so they cannot be expressed consistently here.
+CHANGE_METHODS = frozenset({"full_payment", "installments"})
+
+@dataclass(frozen=True)
+class SpendingChange:
+    """One stop or reduce action on a recurring expense series."""
+
+    event_id: str  # the series' latest settled occurrence
+    category: str
+    description: str
+    new_amount: Decimal | None  # ``None`` stops the series
+    saving: Decimal  # over the projected occurrences in the horizon
+
+    @property
+    def text(self) -> str:
+        if self.new_amount is None:
+            return f"stop:{self.event_id}"
+        return f"reduce_to:{self.event_id}:{money(self.new_amount)}"
+
+
+def _spending_actions(dataset, request, profile, forecast) -> list[SpendingChange]:
+    """Every permitted action, one per recurring expense series, largest saving first.
+
+    The cited event is the series' latest settled occurrence; an action is
+    permitted exactly when the recommendation validator accepts it.
+    """
+    actions = []
+    patterns = recurrence_patterns(dataset.events_for(request.user_id), as_of=request.request_date)
+    for (category, direction, _), pattern in sorted(patterns.items()):
+        event = dataset.event_by_id.get(pattern.event_ids[-1])
+        projected = [
+            -entry.amount
+            for entry in forecast.entries
+            if entry.source_kind == "recurrence" and entry.source_id == f"{category}/debit"
+        ]
+        # ponytail: home-currency expenses only (every flexible debit in the
+        # dataset is); convert minimum_allowed_amount per date if that changes.
+        if direction != "debit" or event is None or not projected or event.currency != forecast.home_currency:
+            continue
+        # Reduce is tried before stop: the smaller change wins when both are permitted.
+        choices = [("stop", None)]
+        if event.minimum_allowed_amount is not None and all(event.minimum_allowed_amount < amount for amount in projected):
+            choices.insert(0, ("reduce_to", event.minimum_allowed_amount))
+        for action, new_amount in choices:
+            issues = []
+            _validate_spending_change(
+                action, event.event_id, new_amount, request, profile, dataset,
+                lambda message, column=None: issues.append(message),
+            )
+            if not issues:
+                saving = sum(amount - (new_amount or 0) for amount in projected)
+                actions.append(SpendingChange(event.event_id, category, event.description, new_amount, saving))
+                break
+    return sorted(actions, key=lambda action: (-action.saving, action.event_id))
+
+
+def _with_changes(forecast, changes: Sequence[SpendingChange]):
+    """The forecast with each changed series' projected occurrences reduced or removed."""
+    by_source = {f"{change.category}/debit": change for change in changes}
+    entries, balance = [], forecast.opening_balance
+    for entry in forecast.entries:
+        change = by_source.get(entry.source_id) if entry.source_kind == "recurrence" else None
+        if change is not None and change.new_amount is None:
+            continue
+        amount = entry.amount if change is None else -change.new_amount
+        balance += amount
+        entries.append(replace(entry, amount=amount, balance_after=balance))
+    return replace(forecast, entries=tuple(entries))
+
+
+def _plan_with_changes(dataset, request, profile, options, forecast):
+    """The first greedy set of up to three changes that makes a plan work.
+
+    Actions are added largest saving first; after each addition the normal
+    candidate generation and ranking run on the changed forecast. Returns
+    ``(changes sorted by event id, best candidate, changed forecast)`` or
+    ``((), None, forecast)`` when no set of up to three is enough.
+    """
+    requested = request.requested_amount
+    chosen: list[SpendingChange] = []
+    for action in _spending_actions(dataset, request, profile, forecast)[:MAX_SPENDING_CHANGES]:
+        chosen.append(action)
+        changed = _with_changes(forecast, chosen)
+        candidates = [
+            candidate
+            for candidate in _candidates(
+                changed, request, profile, options,
+                amount_safe_to_pay(changed, requested), earliest_full_payment_date(changed, requested),
+            )
+            if candidate.method in CHANGE_METHODS
+        ]
+        if candidates:
+            return tuple(sorted(chosen, key=lambda change: change.event_id)), min(candidates, key=Candidate.rank_key), changed
+    return (), None, forecast
+
+
 def money(value: Decimal) -> str:
     """Plain decimal: whole amounts without decimals, otherwise two places."""
     value = value.quantize(CENT)
@@ -156,7 +262,7 @@ def _plan_text(payments: Payments) -> str:
     return "|".join(f"{day.isoformat()}:{money(amount)}" for day, amount in payments)
 
 
-def _explain(candidate, forecast, request, safe, earliest, baseline) -> str:
+def _explain(candidate, forecast, request, safe, earliest, baseline, changes=()) -> str:
     cur = forecast.home_currency
     floor = f"{cur} {money(forecast.minimum_balance_to_keep)} minimum"
     requested = f"{cur} {money(request.requested_amount)}"
@@ -205,6 +311,15 @@ def _explain(candidate, forecast, request, safe, earliest, baseline) -> str:
             f"Use {len(candidate.payments)} installments of {cur} {money(first_amount)} "
             f"starting {first_day.isoformat()} ({candidate.option_id})."
         )
+    if changes:
+        parts = [
+            f"stop {change.description}"
+            if change.new_amount is None
+            else f"reduce {change.description} to {cur} {money(change.new_amount)}"
+            for change in changes
+        ]
+        listed = parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])} and {parts[-1]}"
+        action = f"{listed[0].upper()}{listed[1:]}, then {action[0].lower()}{action[1:]}"
     return (
         f"{action} The lowest projected balance is {cur} {money(candidate.lowest)} on "
         f"{candidate.lowest_date.isoformat()}, keeping the {floor} protected."
@@ -242,14 +357,19 @@ def recommend(dataset, request) -> dict[str, str]:
     earliest = earliest_full_payment_date(forecast, requested)
     candidates = _candidates(forecast, request, profile, options, safe, earliest)
     best = min(candidates, key=Candidate.rank_key) if candidates else None
+    changes, planned = (), forecast
+    if best is None:
+        changes, best, planned = _plan_with_changes(dataset, request, profile, options, forecast)
     explanation = _explain(
-        best, forecast, request, safe, earliest, simulate(forecast, ())[1:]
+        best, planned, request, safe, earliest, simulate(forecast, ())[1:], changes
     )
     if best is None:
         # The contract leaves the earliest date blank for not_recommended.
         method, status, plan, earliest_text = "not_recommended", "not_affordable", NO_PAYMENT_PLAN, ""
     else:
         method, status, plan = best.method, best.status, _plan_text(best.payments)
+        if changes:
+            status = "affordable_with_plan"
         earliest_text = earliest.isoformat() if earliest else ""
     return {
         "request_id": request.request_id,
@@ -258,7 +378,7 @@ def recommend(dataset, request) -> dict[str, str]:
         "recommended_payment_method": method,
         "payment_plan": plan,
         "earliest_date_for_full_payment": earliest_text,
-        "spending_changes_needed": NO_SPENDING_CHANGES,
+        "spending_changes_needed": "|".join(change.text for change in changes) or NO_SPENDING_CHANGES,
         "decision_explanation": explanation,
     }
 
