@@ -23,8 +23,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date
-from typing import Sequence
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Mapping, Sequence
 
 #: Explicit statements that a future payout is not yet money. Each entry is one
 #: independent marker; the wording is matched in the languages the dataset uses.
@@ -282,3 +283,225 @@ def income_holds(
                 ),
             )
     return {stream: hold for stream, hold in holds.items() if stream in streams}
+
+
+# ---------------------------------------------------------------------------
+# Income facts: amounts, paydays and ended income stated by payroll notices.
+# ---------------------------------------------------------------------------
+#
+# A notice is matched on its fact sentences only. The opener, the closing line
+# and any advice in between ("use the revised date for anything you pay around
+# payday", "income that has ended should be removed from future estimates")
+# are never read, so they cannot widen what the stated fact does.
+
+_AMOUNT = r"(?P<currency>[A-Z]{3}) (?P<amount>\d[\d,]*(?:\.\d+)?)"
+_DATE = r"(?P<date>\d{4}-\d{2}-\d{2})"
+_WORDY_DATE = r"(?P<wordy_date>\d{1,2} [A-Z][a-z]+ \d{4})"
+
+#: Stream words, matched against income stream descriptions (English in the
+#: dataset regardless of the notice language).
+SALARY_WORDS = ("salary", "payroll", "wage")
+SEASONAL_WORDS = ("season", "contract", "temporary")
+HOUSEHOLD_WORDS = ("household",)
+
+#: next_only: only the next projected occurrence. from_date: every projected
+#: occurrence on or after ``effective_date`` (the request date when unstated).
+NEXT_ONLY = "next_only"
+FROM_DATE = "from_date"
+
+#: What each kind does when more than one stream matches: ``True`` applies it
+#: to every candidate, ``False`` to none. Whichever keeps less money in the
+#: forecast is the safer reading.
+APPLY_TO_ALL_WHEN_AMBIGUOUS = {
+    "salary_increase": False,
+    "base_salary_confirmed": False,
+    "regular_salary_confirmed": False,
+    "remaining_salary_confirmed": False,
+    "fx_salary_confirmed": False,
+    "next_salary_reduced": True,
+    "temporary_pay": True,
+    "payday_moved": True,
+    "income_ended": True,
+    "one_off_extra": False,
+}
+
+#: (kind, scope, stream words, spared word, pattern). ``spared`` names the one
+#: stream a notice says continues; it is excluded from the targets only when
+#: exactly one candidate carries it.
+INCOME_TEMPLATES: tuple[tuple[str, str, tuple[str, ...], str, re.Pattern[str]], ...] = tuple(
+    (kind, scope, words, spared, re.compile(pattern))
+    for kind, scope, words, spared, pattern in (
+        # T14 salary increase.
+        ("salary_increase", FROM_DATE, SALARY_WORDS, "",
+         rf"monthly salary has increased to {_AMOUNT}\. The change applies from {_DATE}"),
+        ("salary_increase", FROM_DATE, SALARY_WORDS, "",
+         rf"Gaji bulanan Anda naik menjadi {_AMOUNT}\. Perubahan ini berlaku mulai {_DATE}"),
+        # T08 base salary confirmed (the commission hold is income_holds' job).
+        ("base_salary_confirmed", FROM_DATE, ("base",), "",
+         rf"confirmed base salary is {_AMOUNT}"),
+        ("base_salary_confirmed", FROM_DATE, ("base",), "",
+         rf"Gaji pokok yang dikonfirmasi adalah {_AMOUNT}"),
+        # T05 next salary reduced (no Indonesian wording exists in the dataset).
+        ("next_salary_reduced", NEXT_ONLY, SALARY_WORDS, "",
+         rf"next salary is reduced to {_AMOUNT}"),
+        # T07 temporary pay for the next payroll.
+        ("temporary_pay", NEXT_ONLY, SALARY_WORDS, "",
+         rf"temporary monthly pay is {_AMOUNT}\. The reduced amount continues for the next payroll"),
+        ("temporary_pay", NEXT_ONLY, SALARY_WORDS, "",
+         rf"Gaji bulanan sementara Anda adalah {_AMOUNT}\. Jumlah yang lebih rendah masih berlaku untuk penggajian berikutnya"),
+        # T13 regular salary, plus a one-off extra that states no date.
+        ("regular_salary_confirmed", FROM_DATE, SALARY_WORDS, "",
+         rf"regular salary for the next payroll is {_AMOUNT}"),
+        ("regular_salary_confirmed", FROM_DATE, SALARY_WORDS, "",
+         rf"Gaji rutin Anda untuk penggajian berikutnya adalah {_AMOUNT}"),
+        ("one_off_extra", NEXT_ONLY, SALARY_WORDS, "",
+         rf"one-time arrears adjustment of {_AMOUNT}"),
+        ("one_off_extra", NEXT_ONLY, SALARY_WORDS, "",
+         rf"penyesuaian tunggakan satu kali sebesar {_AMOUNT}"),
+        # T22 salary confirmed for a date, converted on that date.
+        ("fx_salary_confirmed", NEXT_ONLY, SALARY_WORDS, "",
+         rf"Your salary of {_AMOUNT} is confirmed for {_DATE}"),
+        ("fx_salary_confirmed", NEXT_ONLY, SALARY_WORDS, "",
+         rf"Gaji sebesar {_AMOUNT} dikonfirmasi untuk {_DATE}"),
+        ("fx_salary_confirmed", NEXT_ONLY, SALARY_WORDS, "",
+         rf"employer has confirmed a {_AMOUNT} salary credit for {_WORDY_DATE}"),
+        # T09 payday moved.
+        ("payday_moved", NEXT_ONLY, SALARY_WORDS, "",
+         rf"confirmed salary is now expected on {_DATE}"),
+        ("payday_moved", NEXT_ONLY, SALARY_WORDS, "",
+         rf"Gaji yang sudah dikonfirmasi kini diperkirakan masuk pada {_DATE}"),
+        # T17 seasonal contract ended.
+        ("income_ended", FROM_DATE, SEASONAL_WORDS, "",
+         r"current seasonal contract has ended"),
+        ("income_ended", FROM_DATE, SEASONAL_WORDS, "",
+         r"Kontrak musiman saat ini telah berakhir"),
+        # T24 employment ended.
+        ("income_ended", FROM_DATE, SALARY_WORDS, "",
+         r"Your employment has ended"),
+        ("income_ended", FROM_DATE, SALARY_WORDS, "",
+         r"Hubungan kerja Anda telah berakhir"),
+        # T20 one household income ended; the salary that remains is stated.
+        ("income_ended", FROM_DATE, HOUSEHOLD_WORDS, "salary",
+         r"One household employment record has ended"),
+        ("income_ended", FROM_DATE, HOUSEHOLD_WORDS, "salary",
+         r"Salah satu sumber pendapatan kerja rumah tangga telah berakhir"),
+        ("remaining_salary_confirmed", FROM_DATE, ("salary",), "",
+         rf"remaining confirmed monthly salary is {_AMOUNT}"),
+        ("remaining_salary_confirmed", FROM_DATE, ("salary",), "",
+         rf"Sisa gaji bulanan yang dikonfirmasi adalah {_AMOUNT}"),
+    )
+)
+
+
+@dataclass(frozen=True)
+class IncomeFact:
+    """One income fact a notice states, not yet tied to a projected stream."""
+
+    kind: str
+    message_id: str
+    sent_at: date
+    scope: str
+    stream_words: tuple[str, ...]
+    #: The stream description of the income event the message links to, if any.
+    related_stream: str = ""
+    spared_word: str = ""
+    amount: Decimal | None = None
+    currency: str | None = None
+    effective_date: date | None = None
+
+
+def _fact_date(match: re.Match[str]) -> date | None:
+    groups = match.groupdict()
+    if groups.get("date"):
+        return date.fromisoformat(groups["date"])
+    if groups.get("wordy_date"):
+        return datetime.strptime(groups["wordy_date"], "%d %B %Y").date()
+    return None
+
+
+def parse_income_facts(text: str, *, message_id: str, sent_at: date, related_stream: str = "") -> list[IncomeFact]:
+    """Every template fact sentence in ``text``, in template order."""
+    text = text.replace("’", "'")
+    facts = []
+    for kind, scope, words, spared, pattern in INCOME_TEMPLATES:
+        for match in pattern.finditer(text):
+            groups = match.groupdict()
+            facts.append(
+                IncomeFact(
+                    kind=kind,
+                    message_id=message_id,
+                    sent_at=sent_at,
+                    scope=scope,
+                    stream_words=words,
+                    related_stream=related_stream,
+                    spared_word=spared,
+                    amount=Decimal(groups["amount"].replace(",", "")) if groups.get("amount") else None,
+                    currency=groups.get("currency"),
+                    effective_date=_fact_date(match),
+                )
+            )
+    return facts
+
+
+def income_facts(dataset, user_id: str, *, as_of: date, request=None) -> list[IncomeFact]:
+    """Income facts from messages that apply to this decision, oldest first.
+
+    A message applies when it is this user's, it had arrived by ``as_of``, and
+    it is addressed to no request or to this one.
+    """
+    facts: list[IncomeFact] = []
+    messages = sorted(
+        dataset.messages_by_user.get(user_id, ()),
+        key=lambda message: (message.sent_at, message.message_id),
+    )
+    for message in messages:
+        if message.sent_at.date() > as_of:
+            continue
+        if message.request_id and (request is None or message.request_id != request.request_id):
+            continue
+        event = dataset.event_by_id.get(message.related_event_id or "")
+        related = (
+            event.description
+            if event is not None
+            and event.user_id == user_id
+            and event.direction == "credit"
+            and event.event_type in INCOME_EVENT_TYPES
+            else ""
+        )
+        facts += parse_income_facts(
+            message.message_text,
+            message_id=message.message_id,
+            sent_at=message.sent_at.date(),
+            related_stream=related,
+        )
+    return facts
+
+
+def fact_targets(fact: IncomeFact, streams: Mapping[str, str]) -> tuple[tuple[str, ...], str | None]:
+    """The projected streams a fact applies to, and a note when it is not clear-cut.
+
+    ``streams`` maps each projected series label to the text that names it
+    (its description, or every description inside a merged series). A linked
+    income event names its stream outright; otherwise the fact's stream words
+    pick candidates. One candidate is the target. Several take the safer
+    reading for the fact's kind; none changes nothing.
+    """
+    if fact.related_stream:
+        matches = [label for label, text in streams.items() if fact.related_stream in text]
+    else:
+        matches = [
+            label
+            for label, text in streams.items()
+            if any(word in text.lower() for word in fact.stream_words)
+        ]
+        spared = [label for label in matches if fact.spared_word and fact.spared_word in streams[label].lower()]
+        if len(spared) == 1 and len(matches) > 1:
+            matches.remove(spared[0])
+    if not matches:
+        return (), f"{fact.message_id}: {fact.kind} matches no projected income stream; nothing changed"
+    if len(matches) == 1:
+        return (matches[0],), None
+    names = ", ".join(sorted(matches))
+    if APPLY_TO_ALL_WHEN_AMBIGUOUS[fact.kind]:
+        return tuple(sorted(matches)), f"{fact.message_id}: {fact.kind} could mean {names}; applied to all (safer)"
+    return (), f"{fact.message_id}: {fact.kind} could mean {names}; applied to none (safer)"

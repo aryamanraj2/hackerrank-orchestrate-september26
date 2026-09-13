@@ -22,10 +22,18 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-from evidence_policy import IncomeHold, income_holds
+from evidence_policy import (
+    FROM_DATE,
+    IncomeFact,
+    IncomeHold,
+    fact_targets,
+    income_facts,
+    income_holds,
+)
 from image_evidence import IMAGE_AMOUNTS_PATH, apply_image_evidence
 from recurrence import (
     RecurrencePattern,
+    _anchored,
     conservative_amount,
     income_stream,
     recurrence_patterns,
@@ -343,6 +351,7 @@ def _recurrence_entries(
     end: date,
     booked: Sequence[tuple[date, Decimal, str, str, str]],
     holds: Mapping[str, IncomeHold],
+    facts: Sequence[IncomeFact] = (),
 ) -> tuple[
     list[tuple[date, Decimal, str, str, str]], list[ForecastBlocker], list[ForecastNote]
 ]:
@@ -354,6 +363,7 @@ def _recurrence_entries(
     patterns = recurrence_patterns(events, as_of=start)
     projected: list[tuple] = []
     credit_candidates: list[tuple] = []
+    facts_by_series = _facts_by_series(facts, patterns, events, events_by_id, notes)
 
     for (category, direction, stream), pattern in sorted(patterns.items()):
         source_id = f"{category}/{direction}" + (f"/{stream}" if stream else "")
@@ -385,9 +395,20 @@ def _recurrence_entries(
         # projection resumes after it and it is never booked twice.
         # ponytail: a same-day settled row the detector leaves out of the series
         # is not matched; add a same-series check if that shows up in data.
+        days = list(pattern.occurrences_between(start, end))
+        overrides: dict[date, tuple[Decimal, str, str]] = {}
+        if direction == "credit":
+            days, overrides, fact_notes = _apply_income_facts(
+                facts_by_series.get(source_id, ()), days, source_id,
+                start=start, end=end, window=window,
+                history=lambda amount, currency, day, pattern=pattern, extremes=extremes: _history_above(
+                    dataset, pattern, extremes, home_currency, amount, currency, day
+                ),
+            )
+            notes += fact_notes
         candidates = [
-            (day, source_id, category, group, window, pattern, extremes, direction)
-            for day in pattern.occurrences_between(start, end)
+            (day, source_id, category, group, window, pattern, extremes, direction, overrides.get(day))
+            for day in days
         ]
         if direction == "credit":
             credit_candidates += candidates
@@ -437,7 +458,22 @@ def _recurrence_entries(
     ]
 
     blocked: set[tuple[str, str]] = set()
-    for day, source_id, category, group, _, pattern, extremes, direction in projected:
+    for day, source_id, category, group, _, pattern, extremes, direction, override in projected:
+        if override is not None:
+            stated, currency, message_id = override
+            amount = _convert(dataset, stated, currency, home_currency, day)
+            if amount is None:
+                blockers.append(
+                    ForecastBlocker(
+                        source_id,
+                        day,
+                        f"{message_id} states {currency} {stated} but no supplied "
+                        f"{currency}->{home_currency} rate on {day}",
+                    )
+                )
+                continue
+            movements.append((day, amount, "recurrence", source_id, category, group))
+            continue
         amount, missing_currency = _projected_amount(
             dataset, pattern, extremes, home_currency, day
         )
@@ -478,6 +514,149 @@ def _hold_for(holds, events, category: str, stream: str):
         return holds.get(stream)
     covered = _stream_names(events, category) & set(holds)
     return holds[sorted(covered)[0]] if covered else None
+
+
+def _facts_by_series(facts, patterns, events, events_by_id, notes) -> dict[str, list[IncomeFact]]:
+    """Each projected income series' message facts, oldest first.
+
+    A newer fact supersedes an older one of the same kind for the same series.
+    Unmatched and ambiguous facts leave a note naming the message.
+    """
+    texts: dict[str, str] = {}
+    for (category, direction, stream), pattern in sorted(patterns.items()):
+        sample = events_by_id.get(pattern.event_ids[-1])
+        if direction != "credit" or sample is None or not _counts_as_income(sample):
+            continue
+        label = f"{category}/credit" + (f"/{stream}" if stream else "")
+        # A merged series answers to every stream inside it.
+        texts[label] = stream or " | ".join(sorted(_stream_names(events, category)))
+    latest: dict[tuple[str, str], IncomeFact] = {}
+    for fact in facts:
+        targets, note = fact_targets(fact, texts)
+        if note:
+            notes.append(ForecastNote(fact.message_id, note))
+        for label in targets:
+            latest[(label, fact.kind)] = fact
+    by_series: dict[str, list[IncomeFact]] = {}
+    for (label, _), fact in latest.items():
+        by_series.setdefault(label, []).append(fact)
+    return {
+        label: sorted(items, key=lambda fact: (fact.sent_at, fact.message_id))
+        for label, items in by_series.items()
+    }
+
+
+#: Facts that decide which dates a series pays on, before any amount is set.
+DATE_FACT_KINDS = frozenset({"income_ended", "payday_moved"})
+
+#: Facts that confirm pay rather than change it. A confirmation that disagrees
+#: with settled history is not an amendment, so it may lower a projected
+#: occurrence but never raise it above the series' own estimate.
+CONFIRMATION_KINDS = frozenset(
+    {"base_salary_confirmed", "regular_salary_confirmed", "remaining_salary_confirmed", "fx_salary_confirmed"}
+)
+
+
+def _history_above(dataset, pattern, extremes, home_currency, amount, currency, day) -> str | None:
+    """The series' own estimate as ``"CUR B"`` when ``amount`` exceeds it, else ``None``.
+
+    Compared in the stated currency when the series has it, otherwise both
+    converted on ``day``. A missing rate is not decided here: the booking
+    reports it as a blocker.
+    """
+    if currency in extremes:
+        history = extremes[currency]
+        return f"{currency} {history}" if amount > history else None
+    stated = _convert(dataset, amount, currency, home_currency, day)
+    history, _ = _projected_amount(dataset, pattern, extremes, home_currency, day)
+    if stated is None or history is None or stated <= history:
+        return None
+    return f"{home_currency} {history}"
+
+
+def _apply_income_facts(
+    facts: Sequence[IncomeFact],
+    days: list[date],
+    source_id: str,
+    *,
+    start: date,
+    end: date,
+    window: int,
+    history=lambda amount, currency, day: None,
+) -> tuple[list[date], dict[date, tuple[Decimal, str, str]], list[ForecastNote]]:
+    """Apply message facts to one income series' projected dates and amounts.
+
+    Date facts settle which occurrences exist; amount facts then value them,
+    oldest message first so a newer one wins where both reach an occurrence.
+    Returns the dates, ``{date: (amount, currency, message_id)}`` overrides
+    and one note per applied fact. Settled history is never touched: only
+    dates already projected from ``start`` onward are in play.
+
+    ``history(amount, currency, day)`` names the series' estimate when a stated
+    amount exceeds it; a confirmation there keeps the history amount.
+    """
+    overrides: dict[date, tuple[Decimal, str, str]] = {}
+    notes: list[ForecastNote] = []
+
+    def note(fact: IncomeFact, text: str) -> None:
+        notes.append(ForecastNote(source_id, f"{fact.message_id}: {text}"))
+
+    for fact in facts:
+        if fact.kind == "income_ended":
+            days = [day for day in days if day < fact.sent_at]
+            note(fact, f"income ended; nothing projected from {fact.sent_at}")
+        elif fact.kind == "payday_moved" and days:
+            moved = fact.effective_date
+            days, months = [], 0
+            while (day := _anchored(moved, months, moved.day)) <= end:
+                if day >= start:
+                    days.append(day)
+                months += 1
+            note(fact, f"payday moved; next occurrence {moved}, later ones on day {moved.day}")
+
+    for fact in facts:
+        if fact.kind in DATE_FACT_KINDS:
+            continue
+        stated = f"{fact.currency} {fact.amount}"
+        if fact.kind == "one_off_extra":
+            note(fact, f"one-off {stated} states no date; not counted")
+            continue
+        if fact.kind == "fx_salary_confirmed":
+            confirmed = fact.effective_date
+            if not start <= confirmed <= end:
+                note(fact, f"confirmed salary on {confirmed} is outside the forecast; ignored")
+                continue
+            # The confirmed credit is that cycle's pay: it replaces the nearest
+            # projected occurrence within half a cadence.
+            near = [day for day in days if abs((day - confirmed).days) < window]
+            replaces = bool(near)
+            if near:
+                days.remove(min(near, key=lambda day: (abs((day - confirmed).days), day)))
+            days = sorted(set(days) | {confirmed})
+            reached = [confirmed]
+        elif fact.scope == FROM_DATE:
+            reached = [day for day in days if day >= (fact.effective_date or start)]
+        else:
+            reached = days[:1]
+        capped: dict[date, str] = {}
+        if fact.kind in CONFIRMATION_KINDS and (fact.kind != "fx_salary_confirmed" or replaces):
+            capped = {
+                day: above
+                for day in reached
+                if (above := history(fact.amount, fact.currency, day)) is not None
+            }
+        for day in reached:
+            if day in capped:
+                overrides.pop(day, None)
+            else:
+                overrides[day] = (fact.amount, fact.currency, fact.message_id)
+        for above in sorted(set(capped.values())):
+            note(fact, f"confirms {stated}, above settled history {above}; history amount kept (safer)")
+        applied = [day for day in reached if day not in capped]
+        if applied or not reached:
+            when = ", ".join(str(day) for day in applied) or "no projected occurrence"
+            note(fact, f"{fact.kind} {stated} applied to {when}")
+    return days, overrides, notes
 
 
 #: A single settled credit is a one-off. Two or more in the same stream look
@@ -557,6 +736,7 @@ def build_forecast(
         end=end,
         booked=movements,
         holds=holds,
+        facts=income_facts(dataset, user_id, as_of=start_date, request=request),
     )
     blockers += projection_blockers
     notes += [ForecastNote(source_id, reason) for source_id, reason in evidence_notes]
